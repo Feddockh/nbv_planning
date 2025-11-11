@@ -1,0 +1,13 @@
+# Blender 4.5.4 LTS MTL File: 'apple_tree_crook_canker.blend'
+# www.blender.org
+
+newmtl japanese_sycamore
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.000000
+d 1.000000
+illum 2
+map_Kd crook_canker_bake_final.png
+map_Ns japanese_sycamore_rough_4k.exr
+map_Bump -bm 1.000000 japanese_sycamore_nor_gl_4k.exr
