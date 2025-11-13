@@ -36,6 +36,7 @@ NUM_RAYS = 20
 MAX_RANGE = 2.0  # Max sensor range in meters
 ALPHA = 0.1  # Cost weight for utility computation
 MIN_INFORMATION_GAIN = 0.1  # Minimum IG to continue exploration
+IMAGE_DETECTION = False  # Whether to run fire blight detection
 
 # ===== Main Script =====
 # Create environment and ground
@@ -117,25 +118,23 @@ for iteration in range(MAX_ITERATIONS):
     print(f"Iteration {iteration + 1}/{MAX_ITERATIONS}")
     print(f"{'='*60}")
 
-    # Get the current image from the "camera" and display it
-    img, depth, segmentation_mask = camera.get_rgba_depth(flash=True, flash_intensity=2.5, shutter_speed=0.1, max_flash_distance=1.5)
-    # plt.imshow(img)
-    # plt.show()
+    if IMAGE_DETECTION:
+        # Get the current image from the "camera" and display it
+        img, depth, segmentation_mask = camera.get_rgba_depth(flash=True, flash_intensity=2.5, shutter_speed=0.1, max_flash_distance=1.5)
 
-    # Convert RGBA to RGB for YOLO (remove alpha channel)
-    img_rgb = img[:, :, :3]
+        # Convert RGBA to RGB for YOLO (remove alpha channel)
+        img_rgb = img[:, :, :3]
+        
+        # Run fire blight detection
+        print("Running fire blight detection...")
+        detections, annotated_img = detector.detect(img_rgb, visualize=True)
+
+        # Print detection results
+        print(f"\nDetection Results:")
+        print(f"  Total detections: {len(detections)}")
+        plt.imshow(annotated_img)
+        plt.show()
     
-    # Run fire blight detection
-    print("Running fire blight detection...")
-    detections, annotated_img = detector.detect(img_rgb, visualize=True)
-
-    # Print detection results
-    print(f"\nDetection Results:")
-    print(f"  Total detections: {len(detections)}")
-    plt.imshow(annotated_img)
-    plt.show()
-    
-
     # Step 1: Capture point cloud
     print("Step 1: Capturing point cloud...")
     points, rgba, valid_mask = camera.get_point_cloud(max_range=MAX_RANGE, pixel_skip=1)
