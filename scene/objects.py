@@ -87,8 +87,10 @@ def URDF(filename, static=False, position=[0, 0, 0], orientation=[0, 0, 0, 1], m
     return Body(body, local_env)
 
 # TODO: Should be in env? Problem is the get_quaternion function is in utils.py which depends on env.py (circular dependency)
-def Ground(position=[0, 0, 0], orientation=[0, 0, 0, 1], local_env=None):
+def Ground(position=[0, 0, 0], orientation=[0, 0, 0, 1], local_env=None, filename=None):
     local_env = local_env if local_env is not None else env.envir
+    if filename is not None:
+        return URDF(filename=filename, static=True, position=position, orientation=get_quaternion(orientation), local_env=local_env)
     return URDF(filename=os.path.join(env.asset_dir, 'plane', 'plane.urdf'), static=True, position=position, orientation=get_quaternion(orientation), local_env=local_env)
     # Randomly set friction of the ground
     # self.ground.set_frictions(self.ground.base, lateral_friction=self.np_random.uniform(0.025, 0.5), spinning_friction=0, rolling_friction=0)

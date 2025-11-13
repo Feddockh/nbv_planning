@@ -40,8 +40,8 @@ MIN_INFORMATION_GAIN = 0.1  # Minimum IG to continue exploration
 # ===== Main Script =====
 # Create environment and ground
 nbv_env = env.Env()
-ground = Ground()
-visualize_coordinate_frame()
+ground = Ground(filename=os.path.join(nbv_env.asset_dir, 'dirt_plane', 'dirt_plane.urdf'))
+# visualize_coordinate_frame()
 
 # Create table and object
 table = URDF(filename=os.path.join(nbv_env.asset_dir, 'table', 'table.urdf'), 
@@ -52,7 +52,7 @@ table = URDF(filename=os.path.join(nbv_env.asset_dir, 'table', 'table.urdf'),
 obj = load_object("apple_tree_crook_canker", obj_position=[0, 0, 0], scale=[0.8, 0.8, 0.8])
 obstacles = [obj, table]
 
-# Get the bounding box of the mustard bottle
+# Get the bounding box
 b_min, b_max = obj.get_AABB()
 size = np.array(b_max) - np.array(b_min)
 half_size = size / 2.0
