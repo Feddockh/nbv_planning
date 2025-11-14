@@ -7,7 +7,9 @@ The robot explores the scene by moving its camera to maximize information gain.
 
 import sys
 import os
+from typing import List, Optional, Tuple, Union, Dict
 import numpy as np
+import heapq
 import matplotlib.pyplot as plt
 import pybullet as p
 
@@ -19,21 +21,23 @@ from utils import get_quaternion, quat_to_normal
 from scene.roi import SphereROI, RectangleROI, ROI
 from scene.scene_representation import OctoMap
 from scene.objects import visualize_coordinate_frame, clear_debug_items, DebugPoints, Ground, URDF, load_object, DebugCoordinateFrame
-from viewpoints.viewpoint_proposal import generate_planar_spherical_cap_candidates
+from viewpoints.viewpoint_proposal import generate_planar_spherical_cap_candidates, sample_views_from_hemisphere
 from viewpoints.viewpoint import Viewpoint, visualize_viewpoint, compute_viewpoint_joint_angles
 from viewpoints.viewpoint_selection import compute_information_gain
 
 
 # ===== Configuration =====
 LEARN_WORKSPACE = False  # Whether to learn the robot workspace or load a known one
-OCTOMAP_RESOLUTION = 0.04  # 2cm voxels
+OCTOMAP_RESOLUTION = 0.03  # 2cm voxels
 NUM_SAMPLES_PER_FRONTIER = 10  # Viewpoints to sample per frontier
-MAX_ITERATIONS = 3  # Maximum NBV iterations
+MAX_ITERATIONS = 15  # Maximum NBV iterations
 CAMERA_WIDTH = 1440
 CAMERA_HEIGHT = 1080
 CAMERA_FOV = 60
-NUM_RAYS = 20
+NUM_RAYS = 25
 MAX_RANGE = 2.0  # Max sensor range in meters
+BEST_RANGE = 0.3  # Ideal sensor range in meters
+MIN_RANGE = 0.01  # Min sensor range in meters
 ALPHA = 0.1  # Cost weight for utility computation
 MIN_INFORMATION_GAIN = 0.1  # Minimum IG to continue exploration
 IMAGE_DETECTION = False  # Whether to run fire blight detection
@@ -73,7 +77,7 @@ robot = Panda(position=[1.0, 0, 0.76], fixed_base=True)
 manip_workspace = ManipulationWorkspace(robot, resolution=0.05)
 if LEARN_WORKSPACE:
     print("Learning robot workspace...")
-    manip_workspace.learn(num_samples=100000)
+    manip_workspace.learn(num_samples=10000000)
     print("Saving workspace...")
     manip_workspace.save("workspace.npz")
 else:
@@ -141,10 +145,10 @@ for iteration in range(MAX_ITERATIONS):
     points, rgba, valid_mask = camera.get_point_cloud(max_range=MAX_RANGE, pixel_skip=1)
     print(f"  Captured {len(points)} total points and {np.sum(valid_mask)} valid points from camera")
 
-    # Display the point cloud and hide the object
-    if np.sum(valid_mask) > 0:
-        valid_points_debug_marker_ids = DebugPoints(points[valid_mask], points_rgb=rgba[valid_mask, :3], size=5)
-        obj.change_visual(link=obj.base, rgba=[1, 1, 1, 0.25])
+    # # Display the point cloud and hide the object
+    # if np.sum(valid_mask) > 0:
+    #     valid_points_debug_marker_ids = DebugPoints(points[valid_mask], points_rgb=rgba[valid_mask, :3], size=5)
+    #     obj.change_visual(link=obj.base, rgba=[1, 1, 1, 0.25])
 
     # # Wait for user to press Enter
     # input("Press Enter to continue...")
@@ -170,65 +174,92 @@ for iteration in range(MAX_ITERATIONS):
     # Step 3: Find ROI frontiers
     print("\nStep 3: Finding ROI frontiers...")
     frontiers = octomap.find_frontiers(min_unknown_neighbors=1)
-    print(f"  Found {len(frontiers)} frontiers") 
-
-    # Visualize frontiers
+    print(f"  Found {len(frontiers)} frontiers")
     frontiers_debug_ids = octomap.visualize_frontiers(frontiers, point_size=10) # Have to make bigger to see past octomap points
 
     # # Wait for user to press Enter
     # input("Press Enter to continue...")
 
-    # Step 4: Generate the viewpoint candidates
-    print("\nStep 4: Generating viewpoint candidates...")
+    # Cluster the frontiers
+    clustered_frontiers = octomap.cluster_frontiers(frontiers, algorithm='hdbscan', min_samples=3, eps=OCTOMAP_RESOLUTION)
+    print(f"  Clustered frontiers into {len(clustered_frontiers['cluster_centers'])} groups")
+    # clustered_frontiers_debug_ids = octomap.visualize_frontier_clusters(clustered_frontiers)
 
-    viewpoint_candidates = generate_planar_spherical_cap_candidates(
-        position=init_camera_pos,
-        orientation=init_camera_orient,
-        half_extent=0.4,
-        spatial_resolution=0.2,
-        max_theta=50.0,
-        angular_resolution=25.0
-    )
-    print(f"  Generated {len(viewpoint_candidates)} viewpoint candidates on plane above object")
+    # # Wait for user to press Enter
+    # input("Press Enter to continue...")
 
+    # Filter out the clusters that are too far to reach
+    reachable_cluster_centers = []
+    for cluster_center in clustered_frontiers["cluster_centers"]:
+        if manip_workspace.min_distance_to_workspace(cluster_center) < BEST_RANGE/2:
+            reachable_cluster_centers.append(cluster_center)
+    print(f"  {len(reachable_cluster_centers)}/{len(clustered_frontiers['cluster_centers'])} frontier clusters are reachable by the robot")
+
+    # Create a partial Fibboni sphere around each cluster centroid and sample viewpoints
+    print("\nStep 4: Generating viewpoint candidates from frontier clusters...")
+    viewpoint_candidates: List[Viewpoint] = []
+    for cluster_center in reachable_cluster_centers:
+        # Generate points on a hemisphere around the cluster center
+        new_viewpoint_candidates = sample_views_from_hemisphere(
+            center=cluster_center,
+            base_orientation=init_camera_orient,
+            min_radius=BEST_RANGE,
+            max_radius=BEST_RANGE + 0.1,
+            num_samples=NUM_SAMPLES_PER_FRONTIER,
+            use_positive_z=False,
+            z_bias_sigma=np.pi/3,
+            min_distance=0.05,
+            max_attempts=1000
+        )
+        viewpoint_candidates.extend(new_viewpoint_candidates)
+    print(f"  Generated {len(viewpoint_candidates)} viewpoint candidates from frontier clusters")
+
+    # # Debugging demo: sample viewpoints around object center
+    # demo_center = reachable_cluster_centers[0]
+    # vp_debug_candidates = viewpoint_candidates[:NUM_SAMPLES_PER_FRONTIER]
     # # Visualize the viewpoints
     # viewpoints_debug_idxs = []
-    # for vp in viewpoint_candidates:
+    # idx = DebugPoints([demo_center], [[0, 1, 1]], size=10.0)
+    # viewpoints_debug_idxs.extend(idx)
+    # for vp in vp_debug_candidates:
     #     idx = visualize_viewpoint(vp)
-    #     viewpoints_debug_idxs.append(idx)
+    #     viewpoints_debug_idxs.extend(idx)
+
+    # # Wait for user to press Enter
+    # input("Press Enter to continue...")
 
     # Step 5: Filter viewpoints by robot workspace
-    print("Step 5: Filtering viewpoints by robot workspace...")
-    filtered_viewpoints: list[Viewpoint] = []
+    print("Step 5: Filtering viewpoints by robot workspace and viewpoint collision...")
+    filtered_viewpoint_candidates: List[Viewpoint] = []
     for vp in viewpoint_candidates:
-        if manip_workspace.is_reachable(vp.position):
-            filtered_viewpoints.append(vp)
+        if manip_workspace.is_reachable(vp.position) and not octomap.is_occupied(vp.position):
+            filtered_viewpoint_candidates.append(vp)
+    print(f"  Filtered to {len(filtered_viewpoint_candidates)} / {len(viewpoint_candidates)} viewpoints")
 
-    print(f"    {len(filtered_viewpoints)} viewpoints remain after filtering by robot workspace")
+    # # Wait for user to press Enter
+    # input("Press Enter to continue...")
 
     # Step 6: Compute information gain for each viewpoint
     print("\nStep 6: Computing information gain for each viewpoint...")
-    for vp in filtered_viewpoints:
+    for vp in filtered_viewpoint_candidates:
         vp.information_gain = compute_information_gain(vp, octomap, fov=CAMERA_FOV, width=CAMERA_WIDTH, height=CAMERA_HEIGHT, max_range=MAX_RANGE, resolution=OCTOMAP_RESOLUTION, num_rays=NUM_RAYS, roi=obj_roi)
-        # print(f"  Viewpoint at {vp.position} has IG = {vp.information_gain:.4f}")
-
+        
     # Step 7: Compute the utility for each viewpoint
     print("\nStep 7: Computing viewpoint utilities...")
-    for vp in filtered_viewpoints:
-        distance_cost = np.linalg.norm(np.array(vp.position) - np.array(init_camera_pos))
+    camera_pos, camera_orient = camera.get_camera_pose()
+    for vp in filtered_viewpoint_candidates:
+        distance_cost = np.linalg.norm(np.array(vp.position) - np.array(camera_pos))
         vp.cost = distance_cost
         vp.utility = vp.information_gain - ALPHA * vp.cost
-        # print(f"  Viewpoint at {vp.position} has utility = {vp.utility:.4f}")
 
     # Step 8: Select the best viewpoint
     print("\nStep 8: Selecting the best viewpoint...")
-    import heapq
-    heap = filtered_viewpoints.copy()
+    heap = filtered_viewpoint_candidates.copy()
     heapq.heapify(heap)
     print(f"  Created a heap with {len(heap)} viewpoints ordered by utility")
 
     # Get the top viewpoint
-    
+    vp_debug_ids = []
     while heap:
         best_vp = heapq.heappop(heap)
         print(f"  Best viewpoint at {best_vp.position} with utility = {best_vp.utility:.4f}, IG = {best_vp.information_gain:.4f}, cost = {best_vp.cost:.4f}")
@@ -242,7 +273,8 @@ for iteration in range(MAX_ITERATIONS):
             print("\nNBV planning complete - scene sufficiently explored")
             break
         
-        vp_debug_ids = visualize_viewpoint(best_vp)
+        new_vp_debug_ids = visualize_viewpoint(best_vp)
+        vp_debug_ids.extend(new_vp_debug_ids)
 
         # Try to compute the IK for the best viewpoint
         best_joint_angles = compute_viewpoint_joint_angles(robot, best_vp, camera)
@@ -263,16 +295,19 @@ for iteration in range(MAX_ITERATIONS):
         break
 
     print(f"\nMoving to best joint angles: {best_joint_angles}")
-    moveto(robot, joint_angles=best_joint_angles, tolerance=0.1)
+    # moveto(robot, joint_angles=best_joint_angles, tolerance=0.1)
+    robot.control(best_joint_angles, set_instantly=True)
 
     # Clear the visualizations from this iteration
     print("Clearing debug visualizations...")
-    if np.sum(valid_mask) > 0 > 0:
-        clear_debug_items(valid_points_debug_marker_ids)
+    # if np.sum(valid_mask) > 0:
+    #     clear_debug_items(valid_points_debug_marker_ids)
     if len(points) > 0:
         clear_debug_items(octomap_debug_ids)
         clear_debug_items(frontiers_debug_ids)
+        # clear_debug_items(clustered_frontiers_debug_ids)
     clear_debug_items(vp_debug_ids)
+    # clear_debug_items(viewpoints_debug_idxs)
     obj.change_visual(link=obj.base, rgba=[1, 1, 1, 1])
 
 print("\nNBV planning demo complete.")

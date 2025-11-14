@@ -124,6 +124,44 @@ class ManipulationWorkspace:
         reachable_indices = np.argwhere(self.grid)
         return np.array([self.voxel_to_world(idx) for idx in reachable_indices])
     
+    def min_distance_to_workspace(self, point):
+        """
+        Find the minimum distance between a point and the reachable workspace.
+        
+        Args:
+            point: [x, y, z] world coordinates
+            
+        Returns:
+            float: Minimum distance to the nearest reachable voxel center.
+                   Returns 0.0 if the point is inside a reachable voxel.
+                   Returns inf if workspace is empty.
+        """
+        if self.grid is None:
+            raise ValueError("Workspace grid is not initialized.")
+        
+        point = np.array(point)
+        
+        # Check if point is already in a reachable voxel
+        if self.is_reachable(point):
+            return 0.0
+        
+        # Get all reachable voxel centers
+        reachable_centers = self.get_reachable_voxel_centers()
+        
+        if len(reachable_centers) == 0:
+            return np.inf
+        
+        # Compute distances to all reachable voxel centers
+        distances = np.linalg.norm(reachable_centers - point, axis=1)
+        
+        # Return minimum distance (subtract half voxel diagonal for surface distance)
+        # This accounts for the fact that we compute to voxel centers
+        min_dist = np.min(distances)
+        voxel_half_diagonal = self.resolution * np.sqrt(3) / 2.0
+        
+        # Return the distance to the voxel surface
+        return max(0.0, min_dist - voxel_half_diagonal)
+    
     def visualize(self, color=[0, 1, 0], point_size=5, env_param=None):
         """Visualize reachable workspace using mengine debug points."""
         if self.grid is None:

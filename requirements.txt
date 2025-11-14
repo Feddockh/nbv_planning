@@ -15,3 +15,5 @@ scipy==1.15.3
 torch==2.9.0
 torchvision==0.24.0
 ultralytics==8.3.227
+ghalton==0.6
+pybullet-planning==0.6.0

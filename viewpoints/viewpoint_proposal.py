@@ -6,91 +6,6 @@ from scipy.spatial.transform import Rotation as R
 from viewpoints.viewpoint import Viewpoint
 
 
-def compute_fibonacci_sphere(position: np.ndarray,
-                             orientation: np.ndarray,
-                             radius: float,
-                             num_samples: int = 20,
-                             hemisphere: bool = True) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """
-    Generate points on a Fibonacci sphere (or hemisphere) around a center point.
-    
-    Args:
-        position: 3D position point
-        orientation: Quaternion [x, y, z, w] defining the sphere's orientation
-        radius: Sphere radius
-        num_samples: Number of points to generate
-        hemisphere: If True, only generate upper hemisphere (useful for cameras)
-        
-    Returns:
-        Tuple of (List of 3D positions on the sphere, List of orientations as quaternions)
-    """
-    points = []
-    orientations = []
-    
-    # Convert quaternion to rotation matrix to extract basis vectors
-    base_rot = R.from_quat(orientation)
-    R_base = base_rot.as_matrix()
-    
-    # Extract basis vectors from rotation matrix
-    # X-axis (right), Y-axis (up), Z-axis (forward)
-    sphere_x = R_base[:, 0]
-    sphere_y = R_base[:, 1]
-    sphere_z = R_base[:, 2]
-    
-    phi = np.pi * (3. - np.sqrt(5.))  # Golden angle in radians
-    
-    for i in range(num_samples):
-        if hemisphere:
-            # Map to hemisphere (z >= 0)
-            y = 1 - (i / float(num_samples - 1))  # y goes from 1 to 0
-            if y < 0:
-                continue
-        else:
-            y = 1 - (i / float(num_samples - 1)) * 2  # y goes from 1 to -1
-        
-        radius_at_y = np.sqrt(1 - y * y)
-        theta = phi * i
-        
-        x = np.cos(theta) * radius_at_y
-        z = np.sin(theta) * radius_at_y
-
-        # Transform from local sphere coordinates to world coordinates
-        # Local coordinates: x, y, z on unit sphere
-        local_point = np.array([x, y, z])
-        
-        # Scale by radius and transform to world coordinates using basis vectors
-        point = position + radius * (local_point[0] * sphere_x + local_point[1] * sphere_y + local_point[2] * sphere_z)
-        points.append(point)
-        
-        # Orientation: camera points inward toward the center (position)
-        # Direction from viewpoint to center
-        direction = position - point
-        direction = direction / np.linalg.norm(direction)
-        
-        # The sphere's forward direction at this point
-        forward = local_point[0] * sphere_x + local_point[1] * sphere_y + local_point[2] * sphere_z
-        forward = forward / np.linalg.norm(forward)
-        
-        # Check if forward and direction are not parallel
-        if np.abs(np.dot(forward, direction)) < 0.9999:
-            # Rotation axis is perpendicular to both
-            rot_axis = np.cross(forward, direction)
-            rot_axis = rot_axis / np.linalg.norm(rot_axis)
-            rot_angle = np.arccos(np.clip(np.dot(forward, direction), -1, 1))
-            
-            rot = R.from_rotvec(rot_angle * rot_axis)
-            quat = rot.as_quat()
-        else:
-            # Direction is parallel to forward
-            if np.dot(forward, direction) > 0:
-                quat = np.array([0, 0, 0, 1])  # Identity
-            else:
-                quat = np.array([1, 0, 0, 0])  # 180 degree rotation around x
-        
-        orientations.append(quat)
-
-    return points, orientations
-
 def _quat_from_two_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
     Minimal-rotation quaternion [x,y,z,w] mapping unit vector a -> b in world.
@@ -116,20 +31,29 @@ def compute_spherical_cap(
     orientation: np.ndarray,          # quaternion [x, y, z, w] (world)
     radius: float,
     angular_resolution: float,         # radians
-    max_theta: float                   # radians
+    max_theta: float,                  # radians
+    look_at_center: bool = False,      # orientation behavior
+    use_positive_z: bool = True        # cap direction
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     """
     Generate (roughly) evenly spaced points and orientations over a spherical cap
-    centered on the camera's forward axis (+Z of the given orientation), with
-    NO roll (minimal twist). Each orientation points from the point on the cap
-    back toward the cap center (i.e., inward).
+    with NO roll (minimal twist).
+    
+    The spherical cap is computed in the reference frame defined by the orientation
+    quaternion. The cap extends along the Z-axis of this frame (either +Z or -Z).
 
     Args:
         position: (3,) cap center in world coordinates.
-        orientation: (4,) base orientation quaternion [x,y,z,w] (world).
+        orientation: (4,) base orientation quaternion [x,y,z,w] (world) that defines
+                     the reference frame for the spherical cap. The cap is computed
+                     along the Z-axis of this frame.
         radius: sphere radius.
         angular_resolution: desired angular spacing on the sphere (radians).
         max_theta: half-angle of the cap (radians).
+        look_at_center: If True, orientations point inward toward the cap center.
+                       If False, orientations point outward away from the center.
+        use_positive_z: If True, compute cap along +Z axis of the orientation frame.
+                       If False, compute cap along -Z axis of the orientation frame.
 
     Returns:
         points: List[(3,)] 3D positions on the spherical cap (world).
@@ -143,9 +67,12 @@ def compute_spherical_cap(
 
     base_rot = R.from_quat(orientation)      # world←camera
     R_base = base_rot.as_matrix()
-    cap_x = R_base[:, 0]                     # local +X (down, by your convention)
-    cap_y = R_base[:, 1]                     # local +Y (left)
+    cap_x = R_base[:, 0]                     # local +X (right/down, by your convention)
+    cap_y = R_base[:, 1]                     # local +Y (up/left)
     cap_z = R_base[:, 2]                     # local +Z (forward)
+    
+    # Flip Z direction if using negative Z axis
+    z_sign = 1.0 if use_positive_z else -1.0
 
     # Build polar rings (include center)
     thetas = [0.0]
@@ -157,14 +84,18 @@ def compute_spherical_cap(
     for ring_idx, theta in enumerate(thetas):
         if theta == 0.0:
             # Center point (unique)
-            local = np.array([0.0, 0.0, radius])
+            local = np.array([0.0, 0.0, z_sign * radius])
             p = position + local[0]*cap_x + local[1]*cap_y + local[2]*cap_z
             points.append(p)
 
-            # Looking inward toward the center => forward points from p -> position
-            # Minimal rotation from base forward (cap_z) to direction (position - p)
-            # direction = position - p
-            direction = p - position # Outward
+            # Compute orientation based on look_at_center flag
+            if look_at_center:
+                # Looking inward toward the center
+                direction = position - p  # Inward
+            else:
+                # Looking outward away from center
+                direction = p - position  # Outward
+            
             direction /= (np.linalg.norm(direction) + 1e-12)
             quat_delta = _quat_from_two_vectors(cap_z, direction)
             q_world = (R.from_quat(quat_delta) * base_rot).as_quat()
@@ -185,15 +116,20 @@ def compute_spherical_cap(
             # Local point on the sphere (camera frame: z forward, y left, x down)
             local_x = radius * np.sin(theta) * np.cos(phi)
             local_y = radius * np.sin(theta) * np.sin(phi)
-            local_z = radius * np.cos(theta)
+            local_z = z_sign * radius * np.cos(theta)
 
             # To world
             p = position + local_x * cap_x + local_y * cap_y + local_z * cap_z
             points.append(p)
 
-            # Orientation: from this point, look back to the center (inward)
-            # direction = position - p
-            direction = p - position # Outward
+            # Compute orientation based on look_at_center flag
+            if look_at_center:
+                # Looking inward toward the center
+                direction = position - p  # Inward
+            else:
+                # Looking outward away from center
+                direction = p - position  # Outward
+            
             direction /= (np.linalg.norm(direction) + 1e-12)
 
             # Minimal rotation from base forward to the desired direction
@@ -203,7 +139,7 @@ def compute_spherical_cap(
 
     return points, quats
 
-def generate_planar_spherical_candidates(position: np.ndarray,
+def generate_planar_spherical_cap_candidates(position: np.ndarray,
                                orientation: np.ndarray,
                                half_extent: float,
                                spatial_resolution: float,
@@ -289,3 +225,134 @@ def generate_planar_spherical_candidates(position: np.ndarray,
     
     return viewpoints
 
+def sample_views_from_hemisphere(center: np.ndarray,
+                                 base_orientation: np.ndarray,
+                                 min_radius: float,
+                                 max_radius: Optional[float] = None,
+                                 num_samples: int = 20,
+                                 use_positive_z: bool = False,
+                                 z_bias_sigma: float = 0.3,
+                                 min_distance: float = 0.1,
+                                 max_attempts: int = 1000) -> List[Viewpoint]:
+    """
+    Randomly sample viewpoints from a hemispherical shell or surface around a center point.
+    
+    Uses Gaussian distribution biased toward the Z-axis with minimum distance constraints
+    between samples. If max_radius equals min_radius or is not provided, samples on the 
+    hemisphere surface. The hemisphere is oriented along either the +Z or -Z axis of the 
+    base_orientation frame. Each viewpoint's orientation faces toward the center.
+    
+    Args:
+        center: 3D center point of the hemisphere
+        base_orientation: Quaternion [x, y, z, w] defining the hemisphere's reference frame.
+                         The hemisphere extends along the Z-axis of this frame.
+        min_radius: Minimum radius of the hemispherical shell (or the surface radius)
+        max_radius: Maximum radius of the hemispherical shell. If None or equal to min_radius,
+                   samples on the hemisphere surface at min_radius.
+        num_samples: Number of viewpoints to randomly sample
+        use_positive_z: If True, hemisphere extends along +Z axis of base_orientation.
+                       If False, hemisphere extends along -Z axis.
+        z_bias_sigma: Standard deviation for Gaussian sampling of theta angle. 
+                     Smaller values (e.g., 0.2) concentrate samples near Z-axis,
+                     larger values (e.g., 0.5) spread them more uniformly. Default 0.3.
+                     The distribution is truncated to [0, pi/2].
+        min_distance: Minimum distance between sampled viewpoint positions to avoid clustering.
+                     Default 0.1 meters.
+        max_attempts: Maximum number of attempts to sample viewpoints before giving up.
+    
+    Returns:
+        List of Viewpoint objects with sampled positions and orientations facing the center
+    """
+    if min_radius < 0:
+        raise ValueError("min_radius must be non-negative")
+    if max_radius is not None and max_radius < min_radius:
+        raise ValueError("max_radius must be >= min_radius")
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    if z_bias_sigma <= 0:
+        raise ValueError("z_bias_sigma must be positive")
+    if min_distance < 0:
+        raise ValueError("min_distance must be non-negative")
+    
+    # Determine if sampling on surface or within shell
+    sample_surface = (max_radius is None or np.isclose(max_radius, min_radius))
+    
+    # Extract basis vectors from base orientation
+    base_rot = R.from_quat(base_orientation)
+    R_base = base_rot.as_matrix()
+    cap_x = R_base[:, 0]  # local +X
+    cap_y = R_base[:, 1]  # local +Y
+    cap_z = R_base[:, 2]  # local +Z (hemisphere axis)
+    
+    # Z-direction sign
+    z_sign = 1.0 if use_positive_z else -1.0
+    
+    viewpoints = []
+    positions = []  # Track positions for minimum distance check
+    
+    attempts = 0
+    while len(viewpoints) < num_samples and attempts < max_attempts:
+        attempts += 1
+        
+        # Sample radius based on mode
+        if sample_surface:
+            # Fixed radius on the hemisphere surface
+            r = min_radius
+        else:
+            # Uniformly sample radius in the shell volume
+            # Use r^3 for volume uniform sampling
+            u = np.random.uniform(0, 1)
+            r_cubed = min_radius**3 + u * (max_radius**3 - min_radius**3)
+            r = r_cubed ** (1.0/3.0)
+        
+        # Gaussian sampling biased toward Z-axis (theta near 0)
+        # Sample from truncated Gaussian in [0, pi/2] with mean at 0
+        theta = np.abs(np.random.normal(0, z_bias_sigma))
+        # Clamp to hemisphere range [0, pi/2]
+        theta = min(theta, np.pi / 2.0)
+        
+        # Uniform sampling for azimuthal angle
+        phi = np.random.uniform(0, 2 * np.pi)
+        
+        # Convert spherical to Cartesian in local frame
+        local_x = r * np.sin(theta) * np.cos(phi)
+        local_y = r * np.sin(theta) * np.sin(phi)
+        local_z = z_sign * r * np.cos(theta)
+        
+        # Transform to world coordinates
+        position = center + local_x * cap_x + local_y * cap_y + local_z * cap_z
+        
+        # Check minimum distance constraint
+        if min_distance > 0 and len(positions) > 0:
+            distances = np.linalg.norm(np.array(positions) - position, axis=1)
+            if np.min(distances) < min_distance:
+                continue  # Too close to existing point, reject and try again
+        
+        # Accept this point
+        positions.append(position)
+        
+        # Compute orientation facing toward the center
+        direction = center - position  # Inward direction
+        direction /= (np.linalg.norm(direction) + 1e-12)
+        
+        # Compute quaternion that rotates cap_z to point toward center
+        quat_delta = _quat_from_two_vectors(cap_z, direction)
+        orientation = (R.from_quat(quat_delta) * base_rot).as_quat()
+        
+        # Create viewpoint
+        viewpoint = Viewpoint(
+            position=position,
+            orientation=orientation,
+            target=center,  # Look at the center
+            information_gain=0.0,
+            cost=0.0,
+            utility=0.0,
+            joint_angles=None
+        )
+        viewpoints.append(viewpoint)
+    
+    if len(viewpoints) < num_samples:
+        print(f"Warning: Only generated {len(viewpoints)}/{num_samples} viewpoints. "
+              f"Try reducing min_distance or increasing the sampling region.")
+    
+    return viewpoints

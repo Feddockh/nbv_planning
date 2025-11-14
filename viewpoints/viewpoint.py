@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from bodies.robot import Robot
 from vision import RobotCamera
 from utils import get_rotation_matrix, multiply_transforms
-from scene.objects import DebugCoordinateFrame
+from scene.objects import DebugCoordinateFrame, DebugPoints
 from utils import get_euler, get_quaternion
 
 
@@ -76,13 +76,21 @@ def compute_viewpoint_joint_angles(robot: Robot, viewpoint: Viewpoint, robot_cam
     )
     return joint_angles
 
-def visualize_viewpoint(viewpoint: Viewpoint, local_env=None):
-    
-    # Visualize a coordinate frame at the viewpoint position and orientation
-    debug_ids = DebugCoordinateFrame(position=viewpoint.position,
-                                     orientation=get_euler(viewpoint.orientation),
-                                     axis_length=0.05,
-                                     axis_radius=0.05,
-                                     local_env=local_env)
+def visualize_viewpoint(viewpoint: Viewpoint, local_env=None, coordinate_frame: bool = True):
+    debug_ids = []
+
+    if coordinate_frame:
+        # Visualize a coordinate frame at the viewpoint position and orientation
+        debug_ids = DebugCoordinateFrame(position=viewpoint.position,
+                                         orientation=get_euler(viewpoint.orientation),
+                                         axis_length=0.05,
+                                         axis_radius=0.05,
+                                         local_env=local_env)
+    else:
+        # Visualize a point at the viewpoint position
+        debug_ids = DebugPoints(points=np.array([viewpoint.position]),
+                                colors=np.array([[0, 0, 1]]),
+                                point_size=5.0,
+                                local_env=local_env)
 
     return debug_ids

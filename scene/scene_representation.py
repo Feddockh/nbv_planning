@@ -1,10 +1,34 @@
 import numpy as np
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 import pyoctomap
+from sklearn.cluster import DBSCAN, HDBSCAN
 
 from scene.objects import DebugPoints
 from scene.roi import RectangleROI
 
+
+def _generate_distinct_colors(n: int) -> List[List[float]]:
+        """Generate n visually distinct colors."""
+        colors = []
+        for i in range(n):
+            hue = i / max(n, 1)
+            # Convert HSV to RGB (simple approximation)
+            h = hue * 6
+            x = 1 - abs((h % 2) - 1)
+            if h < 1:
+                rgb = [1, x, 0]
+            elif h < 2:
+                rgb = [x, 1, 0]
+            elif h < 3:
+                rgb = [0, 1, x]
+            elif h < 4:
+                rgb = [0, x, 1]
+            elif h < 5:
+                rgb = [x, 0, 1]
+            else:
+                rgb = [1, 0, x]
+            colors.append(rgb)
+        return colors
 
 class SceneRepresentation:
     """Base class for object 3D representations."""
@@ -27,7 +51,7 @@ class SceneRepresentation:
         raise NotImplementedError("Subclasses must implement update_stats()")
 
     def visualize(self, free_color: List[float] = [0, 1, 0], occupied_color: List[float] = [1, 1, 0],
-                  point_size: float = 5.0, max_points: int = 10000):
+                  point_size: float = 5.0, max_points: int = 100000):
         """Visualize the object representation using cached free/occupied points."""
         if self.free_points.shape[0] > max_points:
             free_points = self.free_points[:max_points]
@@ -172,14 +196,12 @@ class OctoMap(SceneRepresentation):
         Find frontier voxels - free voxels near the boundary of unknown space.
         
         Args:
-            roi_bounds: Optional bounds array [x_min, y_min, z_min, x_max, y_max, z_max] or ROI object
             min_unknown_neighbors: Minimum unknown neighbors to qualify as frontier
             
         Returns:
             frontiers (np.ndarray): List of frontier positions (Nx3 numpy array)
         """
         frontiers = []
-        checked = set()
         
         if self.bounds is None:
             # Use entire octree
@@ -188,16 +210,15 @@ class OctoMap(SceneRepresentation):
             roi_min, roi_max = np.array(self.bounds[:3]), np.array(self.bounds[3:])
             leaf_iterator = self.octree.begin_leafs_bbx(roi_min, roi_max)
         
-        # Collect all free voxels first
-        free_voxels = []
+        # Iterate through leaves and check for frontiers in one pass
         for leaf_it in leaf_iterator:
-            if not self.octree.isNodeOccupied(leaf_it):
-                coord = np.array(leaf_it.getCoordinate(), dtype=np.float64)
-                free_voxels.append(coord)
-        
-        # Check each free voxel for unknown neighbors
-        for voxel in free_voxels:
-            # Generate 6-neighborhood
+            # Only consider free voxels
+            if self.octree.isNodeOccupied(leaf_it):
+                continue
+            
+            voxel = np.array(leaf_it.getCoordinate(), dtype=np.float64)
+            
+            # Generate 6-neighborhood (connectivity)
             neighbors = [
                 voxel + np.array([self.resolution, 0, 0]),
                 voxel + np.array([-self.resolution, 0, 0]),
@@ -207,28 +228,157 @@ class OctoMap(SceneRepresentation):
                 voxel + np.array([0, 0, -self.resolution]),
             ]
             
-            # Count unknown neighbors
+            # Count unknown neighbors for this voxel
             unknown_count = 0
             for neighbor in neighbors:
-                neighbor_tuple = tuple(neighbor)
-                if neighbor_tuple in checked:
-                    continue
-                checked.add(neighbor_tuple)
-                
                 # Check if neighbor is unknown (search returns None)
                 node = self.octree.search(neighbor)
                 if node is None:
                     unknown_count += 1
             
-            # Add to frontiers if it has unknown neighbors
+            # Add to frontiers if it has enough unknown neighbors
             if unknown_count >= min_unknown_neighbors:
                 frontiers.append(voxel)
 
         # Convert to numpy array and save
-        frontiers = np.array(frontiers)
+        frontiers = np.array(frontiers) if frontiers else np.empty((0, 3))
         self.frontiers = frontiers
         
         return frontiers
+    
+    def cluster_frontiers(self, frontiers: Optional[np.ndarray] = None,
+                            eps: Optional[float] = None, 
+                            min_samples: int = 3, 
+                            algorithm: str = 'dbscan') -> Dict:
+        """
+        Cluster frontier voxels into groups using spatial clustering.
+        
+        Args:
+            frontiers: Optional frontier points to cluster (defaults to self.frontiers)
+            eps: Maximum distance between two samples for clustering (default: 2*resolution)
+            min_samples: Minimum number of samples in a neighborhood to form a cluster
+            algorithm: Clustering algorithm ('dbscan', 'hdbscan')
+            
+        Returns:
+            Dict containing:
+                - 'labels': Cluster labels for each frontier point (-1 for noise)
+                - 'n_clusters': Number of clusters found
+                - 'cluster_centers': Centroid of each cluster (n_clusters x 3)
+                - 'cluster_sizes': Number of points in each cluster
+                - 'clustered_points': Dict mapping cluster_id -> points array
+        """
+        if frontiers is None:
+            frontiers = self.frontiers
+        
+        if len(frontiers) == 0:
+            return {
+                'labels': np.array([]),
+                'n_clusters': 0,
+                'cluster_centers': np.empty((0, 3)),
+                'cluster_sizes': np.array([]),
+                'clustered_points': {}
+            }
+        
+        # Default eps to 2x resolution (adjacent voxels)
+        if eps is None:
+            eps = 2.0 * self.resolution
+        
+        # Perform clustering
+        if algorithm == 'dbscan':
+            clustering = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
+            labels = clustering.fit_predict(frontiers)
+        elif algorithm == 'hdbscan':
+            clustering = HDBSCAN(min_cluster_size=min_samples, 
+                                        cluster_selection_epsilon=eps)
+            labels = clustering.fit_predict(frontiers)
+        else:
+            raise ValueError(f"Unknown algorithm '{algorithm}'. Use 'dbscan' or 'hdbscan'")
+        
+        # Compute cluster statistics
+        unique_labels = np.unique(labels)
+        n_clusters = len(unique_labels[unique_labels >= 0])  # Exclude noise (-1)
+        
+        cluster_centers = []
+        cluster_sizes = []
+        clustered_points = {}
+        
+        for label in unique_labels:
+            if label == -1:
+                continue  # Skip noise points
+            
+            mask = labels == label
+            cluster_points = frontiers[mask]
+            
+            # Compute centroid
+            centroid = np.mean(cluster_points, axis=0)
+            cluster_centers.append(centroid)
+            cluster_sizes.append(len(cluster_points))
+            clustered_points[int(label)] = cluster_points
+        
+        cluster_centers = np.array(cluster_centers) if cluster_centers else np.empty((0, 3))
+        cluster_sizes = np.array(cluster_sizes)
+        
+        return {
+            'labels': labels,
+            'n_clusters': n_clusters,
+            'cluster_centers': cluster_centers,
+            'cluster_sizes': cluster_sizes,
+            'clustered_points': clustered_points
+        }
+    
+    def visualize_frontier_clusters(self, cluster_result: Dict = None, 
+                                    point_size: float = 5.0,
+                                    show_noise: bool = True,
+                                    noise_color: List[float] = [0.5, 0.5, 0.5]) -> List:
+        """
+        Visualize clustered frontiers with different colors for each cluster.
+        
+        Args:
+            cluster_result: Result dict from compute_frontier_clusters() 
+                          (if None, will compute clusters first)
+            point_size: Size of debug points
+            show_noise: Whether to show noise points (label -1)
+            noise_color: RGB color for noise points
+            
+        Returns:
+            List of debug handles
+        """
+        if cluster_result is None:
+            cluster_result = self.cluster_frontiers()
+        
+        debug_handles = []
+        n_clusters = cluster_result['n_clusters']
+        
+        if n_clusters == 0:
+            print("No frontier clusters found")
+            return debug_handles
+        
+        # Generate distinct colors for each cluster
+        colors = _generate_distinct_colors(n_clusters)
+        
+        # Visualize each cluster
+        for cluster_id, points in cluster_result['clustered_points'].items():
+            color = colors[cluster_id % len(colors)]
+            handles = DebugPoints(points, points_rgb=color, size=point_size)
+            if isinstance(handles, list):
+                debug_handles.extend(handles)
+            else:
+                debug_handles.append(handles)
+        
+        # Visualize noise points if requested
+        if show_noise:
+            labels = cluster_result['labels']
+            noise_mask = labels == -1
+            if np.any(noise_mask):
+                noise_points = self.frontiers[noise_mask]
+                handles = DebugPoints(noise_points, points_rgb=noise_color, size=point_size * 0.7)
+                if isinstance(handles, list):
+                    debug_handles.extend(handles)
+                else:
+                    debug_handles.append(handles)
+        
+        print(f"Visualized {n_clusters} frontier clusters with {cluster_result['cluster_sizes'].sum()} total points")
+        return debug_handles
     
     def cast_ray(self, origin, direction, end, ignoreUnknownCells=False, maxRange=-1.0):
         """Cast a ray in the octree from origin in the given direction up to end point."""
@@ -300,6 +450,21 @@ class OctoMap(SceneRepresentation):
                     return point, is_occupied, float(distance)
 
         return None, None, None
+    
+    def is_occupied(self, point: np.ndarray) -> Optional[bool]:
+        """
+        Check if a point is occupied, free, or unknown in the octree.
+        
+        Args:
+            point: 3D point to check
+            
+        Returns:
+            True if occupied, False if free, None if unknown
+        """
+        node = self.octree.search(point)
+        if node is None:
+            return None
+        return self.octree.isNodeOccupied(node)
     
     def save(self, filename: str):
         """Save octree to file."""

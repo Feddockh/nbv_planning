@@ -42,28 +42,27 @@ def compute_information_gain(
 ) -> float:
     """
     Compute the information gain for a given viewpoint based on the octomap.
-        IG_r = N_{A,u,r} / N_{A,r} (if N_{A,r} > 0 else 0)
-        IG   = (1/|R|) * sum_r IG_r
-
-    Where:
-    - N_{A,u,r}: # unknown samples along ray r that lie inside ROI
-    - N_{A,r}  : # total samples along ray r that lie inside ROI
-
-    Rays stop when the first occupied voxel is encountered.
+    
+    Information gain is the average number of unknown voxels discovered per ray.
+    For each ray:
+    - Count unknown voxels along the ray (within ROI if specified)
+    - Stop at max_range or when hitting an occupied voxel
+    
+    IG = (1/|R|) * sum_r (# unknown voxels along ray r)
     
     Args:
         viewpoint (Viewpoint): The candidate viewpoint.
-        scene_representation (SceneRepresentation): The scene representation.
-        fov (float): Camera field of view in degrees.
+        scene_representation (SceneRepresentation): The scene representation (OctoMap).
+        fov (float): Camera horizontal field of view in degrees.
         width (int): Image width in pixels.
         height (int): Image height in pixels.
-        max_range (float): Maximum sensor range.
-        resolution (float): Sampling resolution along each ray.
+        max_range (float): Maximum sensor range in meters.
+        resolution (float): Sampling resolution along each ray in meters.
         num_rays (int): Number of rays to cast (if -1, use all pixels).
-        roi (ROI): The region of interest.
+        roi (ROI): Optional region of interest to constrain counting.
 
     Returns:
-        float: The computed information gain.
+        float: The average number of unknown voxels per ray.
     """
 
     if width <= 0 or height <= 0 or max_range <= 0 or resolution <= 0:
@@ -90,7 +89,8 @@ def compute_information_gain(
     if num_steps <= 0:
         return 0.0
 
-    ray_scores = []
+    total_unknown = 0
+    num_rays_cast = 0
 
     for v in range(0, height, stride_v):
         for u in range(0, width, stride_u):
@@ -104,31 +104,30 @@ def compute_information_gain(
             ray_world = R_wc @ ray_cam
             ray_world /= np.linalg.norm(ray_world)
 
-            n_a_r = 0
-            n_a_ur = 0
+            unknown_count = 0
 
             # March along the ray
             for i in range(1, num_steps + 1):
                 t = i * resolution
                 point = cam_pos + t * ray_world
 
-                # ROI gating: only count points inside the ROI (if any)
+                # ROI gating: skip points outside ROI
                 if roi is not None and not roi.contains(point):
                     continue
 
-                n_a_r += 1
-
+                # Check voxel state
                 node = tree.search(point, depth=max_depth)
                 if node is None:
-                    # Unknown voxel in ROI
-                    n_a_ur += 1
-                    continue
+                    # Unknown voxel - increment counter
+                    unknown_count += 1
                 else:
-                    # Known voxel: if occupied, stop the ray; if free, keep marching
+                    # Known voxel: if occupied, stop the ray
                     if tree.isNodeOccupied(node):
                         break
+                    # If free, continue marching
 
-            ig_r = (n_a_ur / n_a_r) if n_a_r > 0 else 0.0
-            ray_scores.append(ig_r)
+            total_unknown += unknown_count
+            num_rays_cast += 1
 
-    return float(np.mean(ray_scores)) if ray_scores else 0.0
+    # Return average unknown voxels per ray
+    return float(total_unknown / num_rays_cast) if num_rays_cast > 0 else 0.0
