@@ -175,15 +175,15 @@ for iteration in range(MAX_ITERATIONS):
     print("\nStep 3: Finding ROI frontiers...")
     frontiers = octomap.find_frontiers(min_unknown_neighbors=1)
     print(f"  Found {len(frontiers)} frontiers")
-    frontiers_debug_ids = octomap.visualize_frontiers(frontiers, point_size=10) # Have to make bigger to see past octomap points
+    # frontiers_debug_ids = octomap.visualize_frontiers(frontiers, point_size=10) # Have to make bigger to see past octomap points
 
     # # Wait for user to press Enter
     # input("Press Enter to continue...")
 
     # Cluster the frontiers
-    clustered_frontiers = octomap.cluster_frontiers(frontiers, algorithm='hdbscan', min_samples=3, eps=OCTOMAP_RESOLUTION)
+    clustered_frontiers = octomap.cluster_frontiers(frontiers, algorithm='kmeans', min_samples=3, eps=OCTOMAP_RESOLUTION)
     print(f"  Clustered frontiers into {len(clustered_frontiers['cluster_centers'])} groups")
-    # clustered_frontiers_debug_ids = octomap.visualize_frontier_clusters(clustered_frontiers)
+    clustered_frontiers_debug_ids = octomap.visualize_frontier_clusters(clustered_frontiers, point_size=10)
 
     # # Wait for user to press Enter
     # input("Press Enter to continue...")
@@ -304,8 +304,8 @@ for iteration in range(MAX_ITERATIONS):
     #     clear_debug_items(valid_points_debug_marker_ids)
     if len(points) > 0:
         clear_debug_items(octomap_debug_ids)
-        clear_debug_items(frontiers_debug_ids)
-        # clear_debug_items(clustered_frontiers_debug_ids)
+        # clear_debug_items(frontiers_debug_ids)
+        clear_debug_items(clustered_frontiers_debug_ids)
     clear_debug_items(vp_debug_ids)
     # clear_debug_items(viewpoints_debug_idxs)
     obj.change_visual(link=obj.base, rgba=[1, 1, 1, 1])

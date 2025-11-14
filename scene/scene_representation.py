@@ -1,7 +1,7 @@
 import numpy as np
 from typing import List, Optional, Tuple, Union, Dict
 import pyoctomap
-from sklearn.cluster import DBSCAN, HDBSCAN
+from sklearn.cluster import DBSCAN, HDBSCAN, KMeans
 
 from scene.objects import DebugPoints
 from scene.roi import RectangleROI
@@ -249,19 +249,23 @@ class OctoMap(SceneRepresentation):
     def cluster_frontiers(self, frontiers: Optional[np.ndarray] = None,
                             eps: Optional[float] = None, 
                             min_samples: int = 3, 
-                            algorithm: str = 'dbscan') -> Dict:
+                            algorithm: str = 'dbscan',
+                            n_clusters: Optional[int] = None) -> Dict:
         """
         Cluster frontier voxels into groups using spatial clustering.
         
         Args:
             frontiers: Optional frontier points to cluster (defaults to self.frontiers)
-            eps: Maximum distance between two samples for clustering (default: 2*resolution)
+            eps: Maximum distance between two samples for clustering (default: resolution)
+                 Only used for 'dbscan' and 'hdbscan'
             min_samples: Minimum number of samples in a neighborhood to form a cluster
-            algorithm: Clustering algorithm ('dbscan', 'hdbscan')
+                        Only used for 'dbscan' and 'hdbscan'
+            algorithm: Clustering algorithm ('dbscan', 'hdbscan', 'kmeans')
+            n_clusters: Number of clusters for k-means (required if algorithm='kmeans')
             
         Returns:
             Dict containing:
-                - 'labels': Cluster labels for each frontier point (-1 for noise)
+                - 'labels': Cluster labels for each frontier point (-1 for noise in DBSCAN/HDBSCAN)
                 - 'n_clusters': Number of clusters found
                 - 'cluster_centers': Centroid of each cluster (n_clusters x 3)
                 - 'cluster_sizes': Number of points in each cluster
@@ -279,9 +283,9 @@ class OctoMap(SceneRepresentation):
                 'clustered_points': {}
             }
         
-        # Default eps to 2x resolution (adjacent voxels)
+        # Default eps to resolution (adjacent voxels)
         if eps is None:
-            eps = 2.0 * self.resolution
+            eps = self.resolution
         
         # Perform clustering
         if algorithm == 'dbscan':
@@ -291,8 +295,17 @@ class OctoMap(SceneRepresentation):
             clustering = HDBSCAN(min_cluster_size=min_samples, 
                                         cluster_selection_epsilon=eps)
             labels = clustering.fit_predict(frontiers)
+        elif algorithm == 'kmeans':
+            if n_clusters is None:
+                # Auto-determine number of clusters based on frontier density
+                # Use roughly one cluster per (eps)^3 volume
+                n_clusters = max(1, int(len(frontiers) / 20))  # Default heuristic
+                print(f"Auto-determined n_clusters={n_clusters} for k-means")
+            
+            clustering = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = clustering.fit_predict(frontiers)
         else:
-            raise ValueError(f"Unknown algorithm '{algorithm}'. Use 'dbscan' or 'hdbscan'")
+            raise ValueError(f"Unknown algorithm '{algorithm}'. Use 'dbscan', 'hdbscan', or 'kmeans'")
         
         # Compute cluster statistics
         unique_labels = np.unique(labels)
