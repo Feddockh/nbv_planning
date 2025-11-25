@@ -299,7 +299,7 @@ class OctoMap(SceneRepresentation):
             if n_clusters is None:
                 # Auto-determine number of clusters based on frontier density
                 # Use roughly one cluster per (eps)^3 volume
-                n_clusters = max(1, int(len(frontiers) / 20))  # Default heuristic
+                n_clusters = max(1, int(len(frontiers) / 40))  # Default heuristic
                 print(f"Auto-determined n_clusters={n_clusters} for k-means")
             
             clustering = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)

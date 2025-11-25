@@ -13,7 +13,7 @@ class Viewpoint:
     """Represents a candidate viewpoint for NBV planning"""
     position: np.ndarray             # 3D camera position
     orientation: np.ndarray          # Camera orientation (quaternion)
-    target: np.ndarray               # 3D point the camera looks at
+    target: np.ndarray = None        # 3D point the camera looks at
     information_gain: float = 0.0    # IG score
     cost: float = 0.0                # Movement cost
     utility: float = 0.0             # Final utility (IG - α*cost)

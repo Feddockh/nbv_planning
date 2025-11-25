@@ -23,14 +23,22 @@ import numpy as np
 import time
 from typing import List, Optional, Tuple, Union
 import pybullet as p
+from bodies.robot import moveto
 
 try:
     from pybullet_planning import (
-        plan_joint_motion,
         get_joint_positions,
         set_joint_positions,
         get_movable_joints,
         link_from_name,
+        rrt,
+        birrt,
+        MAX_DISTANCE,
+        get_sample_fn,
+        get_distance_fn,
+        get_extend_fn,
+        get_collision_fn,
+        check_initial_end,
     )
     PLANNING_AVAILABLE = True
 except ImportError:
@@ -66,8 +74,29 @@ class MotionPlanner:
             raise ImportError("pybullet_planning is not installed")
         
         self.robot = robot
+        
+        # Get the integer body ID (robot.body should be an integer)
         self.body_id = robot.body
-        self.obstacles = obstacles if obstacles else []
+        if not isinstance(self.body_id, int):
+            if hasattr(self.body_id, 'body'):
+                self.body_id = self.body_id.body
+        
+        if not isinstance(self.body_id, int):
+            raise TypeError(f"Expected body_id to be int, got {type(self.body_id)}: {self.body_id}")
+        
+        # Convert obstacles to integer IDs if they are Body objects
+        if obstacles:
+            self.obstacles = []
+            for obs in obstacles:
+                if isinstance(obs, int):
+                    self.obstacles.append(obs)
+                elif hasattr(obs, 'body'):
+                    # It's a Body object, extract the integer ID
+                    self.obstacles.append(obs.body)
+                else:
+                    raise TypeError(f"Obstacle must be int or Body object, got {type(obs)}")
+        else:
+            self.obstacles = []
         self.self_collisions = self_collisions
         self.disabled_collision_pairs = disabled_collision_pairs if disabled_collision_pairs else []
         
@@ -79,13 +108,36 @@ class MotionPlanner:
         print(f"  Movable joints: {self.movable_joints}")
         print(f"  Obstacles: {len(self.obstacles)}")
         print(f"  Self-collisions: {self.self_collisions}")
+
+    def _plan_joint_motion(self, body, joints, end_conf, obstacles=[], attachments=[],
+                    self_collisions=True, disabled_collisions=set(), extra_disabled_collisions=set(),
+                    weights=None, resolutions=None, max_distance=MAX_DISTANCE, custom_limits={}, 
+                    diagnosis=False, algorithm='birrt', **kwargs):
+        """call birrt to plan a joint trajectory from the robot's **current** conf to ``end_conf``.
+        """
+        assert len(joints) == len(end_conf)
+        sample_fn = get_sample_fn(body, joints, custom_limits=custom_limits)
+        distance_fn = get_distance_fn(body, joints, weights=weights)
+        extend_fn = get_extend_fn(body, joints, resolutions=resolutions)
+        collision_fn = get_collision_fn(body, joints, obstacles=obstacles, attachments=attachments, self_collisions=self_collisions,
+                                        disabled_collisions=disabled_collisions, extra_disabled_collisions=extra_disabled_collisions,
+                                        custom_limits=custom_limits, max_distance=max_distance)
+
+        start_conf = get_joint_positions(body, joints)
+
+        if not check_initial_end(start_conf, end_conf, collision_fn, diagnosis=diagnosis):
+            return None
+        if algorithm == 'birrt':
+            return birrt(start_conf, end_conf, distance_fn, sample_fn, extend_fn, collision_fn, **kwargs)
+        else:
+            return rrt(start_conf, end_conf, distance_fn, sample_fn, extend_fn, collision_fn, **kwargs)
     
     def plan_to_joint_config(self,
                             target_joints: Union[List[float], np.ndarray],
                             joints: List[int] = None,
                             obstacles: List[int] = None,
                             self_collisions: bool = None,
-                            algorithm: str = 'birrt',
+                            algorithm: str = 'rrt',
                             max_distance: float = 0.5,
                             iterations: int = 1000,
                             smooth: int = 50,
@@ -130,7 +182,7 @@ class MotionPlanner:
         # Try planning with restarts
         for attempt in range(restarts):
             try:
-                path = plan_joint_motion(
+                path = self._plan_joint_motion(
                     self.body_id,
                     joints,
                     target_joints,
@@ -138,8 +190,7 @@ class MotionPlanner:
                     self_collisions=self_collisions,
                     disabled_collisions=set(self.disabled_collision_pairs),
                     max_distance=max_distance,
-                    algorithm=algorithm,
-                    iterations=iterations,
+                    algorithm=algorithm
                 )
                 
                 if path is not None:
@@ -149,7 +200,7 @@ class MotionPlanner:
                         path = self._smooth_path(path, joints, obstacles, self_collisions, smooth)
                     
                     elapsed = time.time() - start_time
-                    print(f"✓ Planning succeeded in {elapsed:.2f}s (attempt {attempt+1}/{restarts})")
+                    print(f"  Planning succeeded in {elapsed:.2f}s (attempt {attempt+1}/{restarts})")
                     print(f"  Path length: {len(path)} waypoints")
                     return path
                 
@@ -157,7 +208,7 @@ class MotionPlanner:
                 print(f"  Attempt {attempt+1} failed: {e}")
         
         elapsed = time.time() - start_time
-        print(f"✗ Planning failed after {elapsed:.2f}s and {restarts} attempts")
+        print(f"  Planning failed after {elapsed:.2f}s and {restarts} attempts")
         return None
     
     def plan_to_ee_pose(self,
@@ -248,7 +299,7 @@ class MotionPlanner:
             print(f"  Waypoint {i+1}/{len(subsampled_path)}: {np.round(target_config, 3)}")
             
             # Use robot's moveto function
-            success = self.robot.moveto(
+            success = moveto(
                 robot=self.robot,
                 ee_pose=None,
                 joint_angles=target_config,
@@ -259,10 +310,10 @@ class MotionPlanner:
             )
             
             if not success:
-                print(f"✗ Failed to reach waypoint {i+1}")
+                print(f"  Failed to reach waypoint {i+1}")
                 return False
         
-        print("✓ Path execution completed successfully")
+        print("  Path execution completed successfully")
         return True
     
     def plan_and_execute(self,
@@ -384,37 +435,3 @@ class MotionPlanner:
             if not self.check_collision(config, joints):
                 return False
         return True
-
-
-def smart_moveto(robot, planner, target_joints, direct_timeout=3.0, **kwargs):
-    """
-    Convenience function: try direct control first, fall back to planning.
-    
-    This is useful for simple motions where planning overhead isn't needed,
-    but provides planning as a fallback for difficult configurations.
-    
-    Args:
-        robot: Robot instance
-        planner: MotionPlanner instance
-        target_joints: Target joint configuration
-        direct_timeout: Timeout for direct control attempt
-        **kwargs: Additional arguments for planning/execution
-        
-    Returns:
-        True if target reached (via direct control or planning)
-    """
-    print("Attempting direct control...")
-    success = robot.moveto(
-        robot=robot,
-        ee_pose=None,
-        joint_angles=target_joints,
-        timeout=direct_timeout,
-        **{k: v for k, v in kwargs.items() if k in {'tolerance', 'gains', 'forces'}}
-    )
-    
-    if success:
-        print("✓ Direct control succeeded")
-        return True
-    
-    print("Direct control failed, falling back to motion planning...")
-    return planner.plan_and_execute(target_joints, **kwargs)

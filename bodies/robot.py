@@ -268,16 +268,41 @@ def robot_in_collision(robot: Robot, joint_angles: np.ndarray, obstacles: list =
     robot.control(prev_joint_angles, set_instantly=True)
     return False
 
-def moveto(robot: Robot, ee_pose: tuple = None, joint_angles: np.ndarray = None, tolerance: float = 0.03):
-    """Move robot to a given ee_pose or joint angles. If both are given, ee_pose is used."""
+def moveto(robot: Robot, ee_pose: tuple = None, joint_angles: np.ndarray = None, 
+           tolerance: float = 0.03, timeout: float = 10.0, gains: float = 0.05, 
+           forces: float = 500.0):
+    """Move robot to a given ee_pose or joint angles. If both are given, ee_pose is used.
+    
+    Args:
+        robot: Robot instance
+        ee_pose: Tuple of (position, orientation) for end-effector
+        joint_angles: Target joint angles
+        tolerance: Joint angle tolerance for convergence
+        timeout: Maximum time to reach target (seconds)
+        gains: PD control gains
+        forces: Maximum joint forces
+        
+    Returns:
+        bool: True if target reached within tolerance, False if timeout
+    """
     if ee_pose is not None:
         joint_angles = robot.ik(robot.end_effector, target_pos=ee_pose[0], target_orient=ee_pose[1],
                                 use_current_joint_angles=True)
     if joint_angles is None:
-        return
+        return False
 
-    robot.control(joint_angles, gains=0.05)
+    start_time = time.time()
+    robot.control(joint_angles, gains=gains, forces=forces)
+    
     while np.linalg.norm(robot.get_joint_angles(robot.controllable_joints) - joint_angles) > tolerance:
         env.step_simulation(realtime=True)
-    return
+        
+        # Check timeout
+        if time.time() - start_time > timeout:
+            return False
+        
+        # Keep sending control commands
+        robot.control(joint_angles, gains=gains, forces=forces)
+    
+    return True
 

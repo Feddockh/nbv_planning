@@ -24,12 +24,13 @@ from scene.objects import visualize_coordinate_frame, clear_debug_items, DebugPo
 from viewpoints.viewpoint_proposal import generate_planar_spherical_cap_candidates, sample_views_from_hemisphere
 from viewpoints.viewpoint import Viewpoint, visualize_viewpoint, compute_viewpoint_joint_angles
 from viewpoints.viewpoint_selection import compute_information_gain
+from bodies.planning import MotionPlanner
 
 
 # ===== Configuration =====
 LEARN_WORKSPACE = False  # Whether to learn the robot workspace or load a known one
 OCTOMAP_RESOLUTION = 0.03  # 2cm voxels
-NUM_SAMPLES_PER_FRONTIER = 10  # Viewpoints to sample per frontier
+NUM_SAMPLES_PER_FRONTIER = 50  # Viewpoints to sample per frontier
 MAX_ITERATIONS = 15  # Maximum NBV iterations
 CAMERA_WIDTH = 1440
 CAMERA_HEIGHT = 1080
@@ -72,6 +73,9 @@ env.step_simulation(steps=100, realtime=True)
 
 # Create robot (position it to the side, on the table surface)
 robot = Panda(position=[1.0, 0, 0.76], fixed_base=True)
+
+# # Initialize planner
+# planner = MotionPlanner(robot, self_collisions=False)
 
 # Learn the workspace for the robotic arm by sampling valid IK configurations
 manip_workspace = ManipulationWorkspace(robot, resolution=0.05)
@@ -215,6 +219,10 @@ for iteration in range(MAX_ITERATIONS):
     print(f"  Generated {len(viewpoint_candidates)} viewpoint candidates from frontier clusters")
 
     # # Debugging demo: sample viewpoints around object center
+    # for cluster_id, points in clustered_frontiers['clustered_points'].items():
+    #     color = [1, 0, 0]
+    #     handles = DebugPoints(points, points_rgb=color, size=5.0)
+    #     break
     # demo_center = reachable_cluster_centers[0]
     # vp_debug_candidates = viewpoint_candidates[:NUM_SAMPLES_PER_FRONTIER]
     # # Visualize the viewpoints
@@ -284,10 +292,24 @@ for iteration in range(MAX_ITERATIONS):
             break
         else:
             print(f"  Could not compute IK for best viewpoint, trying next...")
+            # continue
+
+        # # Try to plan path for the best viewpoint
+        # plan = planner.plan_to_joint_config(target_joints=best_joint_angles, 
+        #                                     max_distance=0.1,
+        #                                     iterations=1000,
+        #                                     smooth=100,
+        #                                     restarts=2)
+        
+        # if plan is not None:
+        #     print(f"  Found a collision-free path to the best viewpoint")
+        #     break
+        # else:
+        #     print(f"  Could not find a collision-free path to the best viewpoint, trying next...")
     
     # Check if we found a valid viewpoint
     if best_joint_angles is None:
-        print(f"  ERROR: No valid viewpoint with IK solution found")
+        print(f"  ERROR: No valid viewpoint with IK solution or valid path found")
         print("\nNBV planning stopped - no reachable viewpoints")
         break
 
@@ -297,6 +319,12 @@ for iteration in range(MAX_ITERATIONS):
     print(f"\nMoving to best joint angles: {best_joint_angles}")
     # moveto(robot, joint_angles=best_joint_angles, tolerance=0.1)
     robot.control(best_joint_angles, set_instantly=True)
+    # planner.execute_path(path=plan,
+    #                      speed=1.0,
+    #                      tolerance=0.05,
+    #                      timeout_per_waypoint=5.0,
+    #                      gains=0.05,
+    #                      forces=500.0)
 
     # Clear the visualizations from this iteration
     print("Clearing debug visualizations...")
