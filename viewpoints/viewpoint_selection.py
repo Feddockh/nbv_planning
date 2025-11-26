@@ -71,8 +71,7 @@ def compute_information_gain(
     # Determine pixel stride based on desired ray count
     stride_u, stride_v = _compute_ray_strides(width, height, num_rays)
 
-    # Camera pose and intrinsics
-    cam_pos = np.asarray(viewpoint.position, dtype=np.float64)
+    # Camera extrinsics
     R_wc = _quat_to_rotmat_xyzw(np.asarray(viewpoint.orientation, dtype=np.float64))  # world<-cam
 
     hfov = np.deg2rad(float(fov))
@@ -84,36 +83,35 @@ def compute_information_gain(
     tree = scene_representation.octree
     max_depth = int(tree.getTreeDepth())
 
-    # Marching setup
-    num_steps = int(np.floor(max_range / resolution))
-    if num_steps <= 0:
-        return 0.0
-
     total_unknown = 0
     num_rays_cast = 0
-
     for v in range(0, height, stride_v):
         for u in range(0, width, stride_u):
             # Ray in camera frame (z forward, x right, y down in image coords)
             x = (u - cx) / focal
             y = (v - cy) / focal
-            ray_cam = np.array([x, y, 1.0], dtype=np.float64)
+            ray_cam = np.array([x, y, 1.0], dtype=np.float32)
             ray_cam /= np.linalg.norm(ray_cam)
 
             # Transform to world frame
             ray_world = R_wc @ ray_cam
             ray_world /= np.linalg.norm(ray_world)
 
-            unknown_count = 0
-
             # March along the ray
-            for i in range(1, num_steps + 1):
+            unknown_count = 0
+            prev_point_in_roi = False
+            for i in range(0, int(max_range / resolution)):
                 t = i * resolution
-                point = cam_pos + t * ray_world
+                point = np.asarray(viewpoint.position, dtype=np.float32) + t * ray_world
+
+                # End ray if the current point is outside the ROI and the previous point was inside (single convex ROI)
+                if not roi.contains(point) and prev_point_in_roi:
+                    break
+                prev_point_in_roi = roi.contains(point)
 
                 # ROI gating: skip points outside ROI
-                if roi is not None and not roi.contains(point):
-                    continue
+                if not roi.contains(point):
+                    continue # Skips the rest of the loop
 
                 # Check voxel state
                 node = tree.search(point, depth=max_depth)
