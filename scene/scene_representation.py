@@ -488,3 +488,376 @@ class OctoMap(SceneRepresentation):
         """Load octree from file."""
         self.octree.readBinary(filename)
         print(f"OctoMap loaded from {filename}")
+
+
+class SemanticOctoMap(OctoMap):
+    """
+    Extension of OctoMap that includes semantic information (class labels and confidence scores).
+    
+    Each voxel stores:
+    - Occupancy probability (from base OctoMap)
+    - Semantic class label c_s(x)
+    - Confidence score p_s(x)
+    
+    Semantic information is updated using max-fusion method when new observations are available.
+    """
+    
+    def __init__(self, bounds: Optional[Union[np.ndarray, RectangleROI]] = None, resolution: float = 0.05):
+        super().__init__(bounds, resolution)
+        
+        # Store semantic information per voxel
+        # Key: voxel coordinate tuple (x, y, z), Value: {'label': int, 'confidence': float}
+        self.semantic_map: Dict[Tuple[float, float, float], Dict] = {}
+        
+        # Optional: track class names for visualization
+        self.class_names: Dict[int, str] = {}
+    
+    def _voxel_key(self, point: np.ndarray) -> Tuple[float, float, float]:
+        """
+        Convert a point to a voxel key by snapping to the voxel center.
+        
+        Args:
+            point: 3D point
+            
+        Returns:
+            Tuple of (x, y, z) representing the voxel center
+        """
+        # Use OctoMap's coordinate to key conversion
+        ok, key = self.octree.coordToKeyChecked(point, depth=self.octree.getTreeDepth())
+        if ok:
+            center = self.octree.keyToCoord(key, depth=self.octree.getTreeDepth())
+            # Round to avoid floating point precision issues
+            return tuple(np.round(center, decimals=6))
+        else:
+            # Fallback: manual snapping
+            snapped = np.round(point / self.resolution) * self.resolution
+            return tuple(np.round(snapped, decimals=6))
+    
+    def add_semantic_point_cloud(self, point_cloud: np.ndarray, 
+                                 labels: np.ndarray, 
+                                 confidences: np.ndarray,
+                                 sensor_origin: np.ndarray,
+                                 max_range: float = -1.0,
+                                 lazy_eval: bool = False,
+                                 discretize: bool = True,
+                                 mismatch_penalty: float = 0.1):
+        """
+        Add a semantic point cloud to the octree with max-fusion update.
+        
+        Args:
+            point_cloud: Nx3 array of 3D points
+            labels: N array of semantic class labels (integers)
+            confidences: N array of confidence scores (0.0 to 1.0)
+            sensor_origin: 3D point representing sensor position
+            max_range: Maximum range for points (-1.0 = no limit)
+            lazy_eval: If True, delay updates to inner nodes for efficiency
+            discretize: If True, discretize points to voxel centers before insertion
+            mismatch_penalty: Penalty factor for label mismatch (default 0.1 = 10%)
+            
+        Returns:
+            update_stats: Dict with statistics about semantic updates
+        """
+        point_cloud = np.asarray(point_cloud, dtype=np.float64)
+        labels = np.asarray(labels, dtype=np.int32)
+        confidences = np.asarray(confidences, dtype=np.float64)
+        
+        if point_cloud.shape[0] != labels.shape[0] or point_cloud.shape[0] != confidences.shape[0]:
+            raise ValueError(f"Point cloud, labels, and confidences must have same length")
+        
+        # First, update the volumetric occupancy (from base OctoMap)
+        success_count = self.add_point_cloud(point_cloud, sensor_origin, max_range, lazy_eval, discretize)
+        
+        # Track statistics
+        stats = {
+            'total_points': len(point_cloud),
+            'new_voxels': 0,
+            'updated_same_label': 0,
+            'updated_different_label': 0,
+            'volumetric_insertions': success_count
+        }
+        
+        # Update semantic information using max-fusion
+        for i, point in enumerate(point_cloud):
+            voxel_key = self._voxel_key(point)
+            new_label = int(labels[i])
+            new_confidence = float(confidences[i])
+            
+            # Clamp confidence to [0, 1]
+            new_confidence = np.clip(new_confidence, 0.0, 1.0)
+            
+            if voxel_key not in self.semantic_map:
+                # No prior semantic information - directly assign
+                self.semantic_map[voxel_key] = {
+                    'label': new_label,
+                    'confidence': new_confidence
+                }
+                stats['new_voxels'] += 1
+            else:
+                # Max-fusion update
+                prev_label = self.semantic_map[voxel_key]['label']
+                prev_confidence = self.semantic_map[voxel_key]['confidence']
+                
+                if new_label == prev_label:
+                    # Same label - average the confidence scores
+                    updated_confidence = (prev_confidence + new_confidence) / 2.0
+                    self.semantic_map[voxel_key] = {
+                        'label': new_label,
+                        'confidence': updated_confidence
+                    }
+                    stats['updated_same_label'] += 1
+                else:
+                    # Different labels - choose the one with higher confidence
+                    # Apply penalty to the chosen confidence
+                    if new_confidence > prev_confidence:
+                        chosen_label = new_label
+                        chosen_confidence = new_confidence * (1.0 - mismatch_penalty)
+                    else:
+                        chosen_label = prev_label
+                        chosen_confidence = prev_confidence * (1.0 - mismatch_penalty)
+                    
+                    self.semantic_map[voxel_key] = {
+                        'label': chosen_label,
+                        'confidence': chosen_confidence
+                    }
+                    stats['updated_different_label'] += 1
+        
+        return stats
+    
+    def get_semantic_info(self, point: np.ndarray) -> Optional[Dict]:
+        """
+        Get semantic information for a point.
+        
+        Args:
+            point: 3D point
+            
+        Returns:
+            Dict with 'label' and 'confidence', or None if no semantic info exists
+        """
+        voxel_key = self._voxel_key(point)
+        return self.semantic_map.get(voxel_key, None)
+    
+    def get_voxels_by_label(self, label: int, min_confidence: float = 0.0) -> np.ndarray:
+        """
+        Get all voxel positions with a specific semantic label.
+        
+        Args:
+            label: Semantic class label to filter by
+            min_confidence: Minimum confidence threshold
+            
+        Returns:
+            Nx3 array of voxel positions
+        """
+        voxels = []
+        for voxel_key, semantic_info in self.semantic_map.items():
+            if semantic_info['label'] == label and semantic_info['confidence'] >= min_confidence:
+                voxels.append(voxel_key)
+        
+        return np.array(voxels) if voxels else np.empty((0, 3))
+    
+    def get_uncertain_voxels(self, max_confidence: float = 0.5) -> np.ndarray:
+        """
+        Get voxels with low semantic confidence (high uncertainty).
+        
+        Args:
+            max_confidence: Maximum confidence threshold for uncertainty
+            
+        Returns:
+            Nx3 array of uncertain voxel positions
+        """
+        voxels = []
+        for voxel_key, semantic_info in self.semantic_map.items():
+            if semantic_info['confidence'] <= max_confidence:
+                voxels.append(voxel_key)
+        
+        return np.array(voxels) if voxels else np.empty((0, 3))
+    
+    def update_stats(self, verbose: bool = False, max_points: int = 10000) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute statistics about the octree occupancy (extends base class).
+        Also prints semantic statistics if verbose=True.
+        
+        Args:
+            verbose: If True, print statistics to console
+            max_points: Maximum number of voxel points to consider for stats
+            
+        Returns:
+            free_points: Nx3 array of free voxel positions
+            occupied_points: Mx3 array of occupied voxel positions
+        """
+        # Call base class method
+        free_points, occupied_points = super().update_stats(verbose=False, max_points=max_points)
+        
+        # Print semantic statistics
+        if verbose:
+            print(f"Free voxels: {len(free_points)}")
+            print(f"Occupied voxels: {len(occupied_points)}")
+            print(f"Total visualized: {len(free_points) + len(occupied_points)}")
+            print(f"Total tree size: {self.octree.size()}")
+            print(f"Semantic voxels: {len(self.semantic_map)}")
+            
+            # Count voxels per label
+            label_counts = {}
+            for semantic_info in self.semantic_map.values():
+                label = semantic_info['label']
+                label_counts[label] = label_counts.get(label, 0) + 1
+            
+            print("Voxels per semantic label:")
+            for label, count in sorted(label_counts.items()):
+                label_name = self.class_names.get(label, f"Class {label}")
+                print(f"  {label_name}: {count}")
+        
+        return free_points, occupied_points
+    
+    def visualize_semantic(self, label: Optional[int] = None,
+                          min_confidence: float = 0.0,
+                          color: Optional[List[float]] = None,
+                          point_size: float = 5.0,
+                          max_points: int = 100000) -> List:
+        """
+        Visualize semantic voxels, optionally filtered by label.
+        
+        Args:
+            label: If specified, only visualize voxels with this label (None = all)
+            min_confidence: Minimum confidence threshold
+            color: RGB color for visualization (if None, auto-generate per label)
+            point_size: Size of debug points
+            max_points: Maximum number of points to visualize
+            
+        Returns:
+            List of debug handles
+        """
+        debug_handles = []
+        
+        if label is not None:
+            # Visualize specific label
+            voxels = self.get_voxels_by_label(label, min_confidence)
+            if len(voxels) == 0:
+                print(f"No voxels found for label {label}")
+                return debug_handles
+            
+            if len(voxels) > max_points:
+                voxels = voxels[:max_points]
+                print(f"WARN: Limiting visualization to {max_points} points.")
+            
+            viz_color = color if color is not None else [1, 0, 1]
+            handles = DebugPoints(voxels, points_rgb=viz_color, size=point_size)
+            if isinstance(handles, list):
+                debug_handles.extend(handles)
+            else:
+                debug_handles.append(handles)
+            
+            label_name = self.class_names.get(label, f"Class {label}")
+            print(f"Visualized {len(voxels)} voxels for {label_name}")
+        else:
+            # Visualize all labels with different colors
+            label_to_voxels = {}
+            for voxel_key, semantic_info in self.semantic_map.items():
+                if semantic_info['confidence'] >= min_confidence:
+                    lbl = semantic_info['label']
+                    if lbl not in label_to_voxels:
+                        label_to_voxels[lbl] = []
+                    label_to_voxels[lbl].append(voxel_key)
+            
+            if not label_to_voxels:
+                print("No semantic voxels to visualize")
+                return debug_handles
+            
+            # Generate colors for each label
+            unique_labels = sorted(label_to_voxels.keys())
+            colors = _generate_distinct_colors(len(unique_labels))
+            
+            total_visualized = 0
+            for i, lbl in enumerate(unique_labels):
+                voxels = np.array(label_to_voxels[lbl])
+                if len(voxels) > max_points // len(unique_labels):
+                    voxels = voxels[:max_points // len(unique_labels)]
+                
+                viz_color = colors[i]
+                handles = DebugPoints(voxels, points_rgb=viz_color, size=point_size)
+                if isinstance(handles, list):
+                    debug_handles.extend(handles)
+                else:
+                    debug_handles.append(handles)
+                
+                total_visualized += len(voxels)
+            
+            print(f"Visualized {total_visualized} semantic voxels across {len(unique_labels)} labels")
+        
+        return debug_handles
+    
+    def visualize_uncertainty(self, max_confidence: float = 0.5,
+                             color: List[float] = [1, 0.5, 0],
+                             point_size: float = 5.0,
+                             max_points: int = 100000) -> List:
+        """
+        Visualize uncertain voxels (low confidence scores).
+        
+        Args:
+            max_confidence: Maximum confidence to be considered uncertain
+            color: RGB color for uncertain voxels
+            point_size: Size of debug points
+            max_points: Maximum number of points to visualize
+            
+        Returns:
+            List of debug handles
+        """
+        uncertain_voxels = self.get_uncertain_voxels(max_confidence)
+        
+        if len(uncertain_voxels) == 0:
+            print("No uncertain voxels found")
+            return []
+        
+        if len(uncertain_voxels) > max_points:
+            uncertain_voxels = uncertain_voxels[:max_points]
+            print(f"WARN: Limiting visualization to {max_points} points.")
+        
+        debug_handles = DebugPoints(uncertain_voxels, points_rgb=color, size=point_size)
+        print(f"Visualized {len(uncertain_voxels)} uncertain voxels")
+        
+        if isinstance(debug_handles, list):
+            return debug_handles
+        else:
+            return [debug_handles]
+    
+    def set_class_names(self, class_names: Dict[int, str]):
+        """
+        Set human-readable names for semantic class labels.
+        
+        Args:
+            class_names: Dict mapping label integers to class name strings
+        """
+        self.class_names = class_names
+    
+    def save_semantic(self, octree_filename: str, semantic_filename: str):
+        """
+        Save both octree and semantic information to files.
+        
+        Args:
+            octree_filename: Path to save octree binary
+            semantic_filename: Path to save semantic map (numpy)
+        """
+        # Save base octree
+        self.save(octree_filename)
+        
+        # Save semantic map
+        np.savez(semantic_filename, 
+                 semantic_map=dict(self.semantic_map),
+                 class_names=self.class_names)
+        print(f"Semantic information saved to {semantic_filename}")
+    
+    def load_semantic(self, octree_filename: str, semantic_filename: str):
+        """
+        Load both octree and semantic information from files.
+        
+        Args:
+            octree_filename: Path to octree binary file
+            semantic_filename: Path to semantic map file
+        """
+        # Load base octree
+        self.load(octree_filename)
+        
+        # Load semantic map
+        data = np.load(semantic_filename, allow_pickle=True)
+        self.semantic_map = data['semantic_map'].item()
+        self.class_names = data['class_names'].item()
+        print(f"Semantic information loaded from {semantic_filename}")

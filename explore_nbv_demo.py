@@ -3,6 +3,21 @@ Next-Best-View Planning Demo
 
 Simple demonstration of active perception using octomap for volumetric mapping.
 The robot explores the scene by moving its camera to maximize information gain.
+
+This algorithm follows these steps:
+1. Capture point cloud from current viewpoint
+2. Add point cloud to octomap
+3. Find frontiers in the octomap within the ROI
+4. Sample viewpoint candidates in plane with spherical caps
+5. Sample additional viewpoint candidates around the frontiers
+6. Filter viewpoints by robot workspace and collision
+7. Compute information gain for each viewpoint
+    - Short rays are cast from the viewpoint into the octomap
+8. Compute utility for each viewpoint (IG - alpha * cost)
+9. Select the best viewpoint and move the robot there
+10. Repeat until maximum iterations or minimum information gain reached
+
+For the semantic version, add the semantic gain into the total utility/gain function.
 """
 
 import sys
