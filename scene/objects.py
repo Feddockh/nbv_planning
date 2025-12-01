@@ -118,7 +118,7 @@ def Points(point_positions, rgba=[1, 0, 0, 1], radius=0.01, replace_points=None,
     if replace_points is not None:
         for i in range(min(len(point_positions), len(replace_points))):
             replace_points[i].set_base_pos_orient(point_positions[i])
-            return replace_points
+        return replace_points
     else:
         points = Shapes(Sphere(radius=radius), static=True, positions=point_positions, orientation=[0, 0, 0, 1], visual=True, collision=False, rgba=rgba, local_env=local_env)
         return points

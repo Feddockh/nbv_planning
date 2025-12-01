@@ -578,6 +578,14 @@ class SemanticOctoMap(OctoMap):
         
         # Update semantic information using max-fusion
         for i, point in enumerate(point_cloud):
+
+            # Check if the point is within max_range
+            if max_range > 0.0:
+                distance = np.linalg.norm(point - sensor_origin)
+                if distance > max_range:
+                    continue  # Skip points beyond max range
+
+            # Get voxel key
             voxel_key = self._voxel_key(point)
             new_label = int(labels[i])
             new_confidence = float(confidences[i])
@@ -710,7 +718,7 @@ class SemanticOctoMap(OctoMap):
     
     def visualize_semantic(self, label: Optional[int] = None,
                           min_confidence: float = 0.0,
-                          color: Optional[List[float]] = None,
+                          colors: Optional[List[List[float]]] = None,
                           point_size: float = 5.0,
                           max_points: int = 100000) -> List:
         """
@@ -719,7 +727,7 @@ class SemanticOctoMap(OctoMap):
         Args:
             label: If specified, only visualize voxels with this label (None = all)
             min_confidence: Minimum confidence threshold
-            color: RGB color for visualization (if None, auto-generate per label)
+            colors: List of RGB colors for visualization (if None, auto-generate per label)
             point_size: Size of debug points
             max_points: Maximum number of points to visualize
             
@@ -728,8 +736,8 @@ class SemanticOctoMap(OctoMap):
         """
         debug_handles = []
         
+        # Visualize specific label
         if label is not None:
-            # Visualize specific label
             voxels = self.get_voxels_by_label(label, min_confidence)
             if len(voxels) == 0:
                 print(f"No voxels found for label {label}")
@@ -739,7 +747,7 @@ class SemanticOctoMap(OctoMap):
                 voxels = voxels[:max_points]
                 print(f"WARN: Limiting visualization to {max_points} points.")
             
-            viz_color = color if color is not None else [1, 0, 1]
+            viz_color = colors[0] if colors is not None else [1, 0, 1]
             handles = DebugPoints(voxels, points_rgb=viz_color, size=point_size)
             if isinstance(handles, list):
                 debug_handles.extend(handles)
@@ -748,8 +756,9 @@ class SemanticOctoMap(OctoMap):
             
             label_name = self.class_names.get(label, f"Class {label}")
             print(f"Visualized {len(voxels)} voxels for {label_name}")
+
+        # Visualize all labels with different colors
         else:
-            # Visualize all labels with different colors
             label_to_voxels = {}
             for voxel_key, semantic_info in self.semantic_map.items():
                 if semantic_info['confidence'] >= min_confidence:
@@ -764,7 +773,8 @@ class SemanticOctoMap(OctoMap):
             
             # Generate colors for each label
             unique_labels = sorted(label_to_voxels.keys())
-            colors = _generate_distinct_colors(len(unique_labels))
+            if colors is None:
+                colors = _generate_distinct_colors(len(unique_labels))
             
             total_visualized = 0
             for i, lbl in enumerate(unique_labels):

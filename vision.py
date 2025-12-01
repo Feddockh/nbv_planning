@@ -181,7 +181,7 @@ class RobotCamera(Camera):
         self.look_at_pos = np.array(look_at_pos)
         self.camera_orient = np.array(cam_orient)
 
-    def get_camera_pose(self):
+    def get_camera_pose(self, update=True):
         """
         Get the current camera pose (position and orientation).
         
@@ -189,7 +189,8 @@ class RobotCamera(Camera):
             camera_pos: 3D position of the camera in world frame
             camera_orient: orientation of the camera as a quaternion [x, y, z, w]
         """
-        self.update_camera_pose()
+        if update:
+            self.update_camera_pose()
         return self.camera_pos, self.camera_orient
 
     def get_point_cloud(self, body=None, max_range=2.0, pixel_skip=1, **kwargs):
