@@ -533,6 +533,66 @@ class SemanticOctoMap(OctoMap):
             snapped = np.round(point / self.resolution) * self.resolution
             return tuple(np.round(snapped, decimals=6))
     
+    @staticmethod
+    def create_semantic_point_cloud_from_detections(rgb_image: np.ndarray, 
+                                                     point_cloud: np.ndarray, 
+                                                     detections: List[Dict],
+                                                     background_label: int = -1, 
+                                                     background_confidence: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create a semantic point cloud by associating detection labels with 3D points.
+        
+        For overlapping detections, the detection with highest confidence is used.
+        
+        Args:
+            rgb_image: RGB image (H, W, 3)
+            point_cloud: Point cloud (N, 3) corresponding to image pixels
+            detections: List of detection dicts with keys: 'bbox', 'class_id', 'confidence'
+            background_label: Label for points not in any detection box
+            background_confidence: Confidence for points not in any detection box
+        
+        Returns:
+            labels: Array of semantic labels (N,)
+            confidences: Array of confidence scores (N,)
+        """
+        height, width = rgb_image.shape[:2]
+        
+        # Initialize all points with background label and confidence
+        labels = np.full(len(point_cloud), background_label, dtype=np.int32)
+        confidences = np.full(len(point_cloud), background_confidence, dtype=np.float32)
+        
+        # Check if point cloud matches image dimensions
+        if len(point_cloud) != height * width:
+            print(f"Warning: Point cloud size ({len(point_cloud)}) doesn't match image size ({height * width})")
+            return labels, confidences
+        
+        # Sort detections by confidence (ascending), so higher confidence overwrites lower
+        sorted_detections = sorted(detections, key=lambda d: d['confidence'])
+        
+        # For each detection, assign its label to points in the bounding box
+        for det in sorted_detections:
+            x1, y1, x2, y2 = det['bbox']
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            
+            # Clip to image bounds
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width-1, x2), min(height-1, y2)
+            
+            # Create mask for bounding box using vectorized operations
+            # Create grid of v, u coordinates
+            v_indices, u_indices = np.meshgrid(np.arange(y1, y2+1), np.arange(x1, x2+1), indexing='ij')
+            
+            # Flatten and compute linear indices
+            bbox_indices = v_indices.ravel() * width + u_indices.ravel()
+            
+            # Filter valid indices and assign labels
+            # Since sorted by confidence ascending, higher confidence will overwrite lower
+            valid = bbox_indices < len(labels)
+            labels[bbox_indices[valid]] = det['class_id']
+            confidences[bbox_indices[valid]] = det['confidence']
+        
+        return labels, confidences
+    
     def add_semantic_point_cloud(self, point_cloud: np.ndarray, 
                                  labels: np.ndarray, 
                                  confidences: np.ndarray,
