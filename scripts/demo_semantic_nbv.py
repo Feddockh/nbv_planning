@@ -24,7 +24,7 @@ from scene.scene_representation import OctoMap, SemanticOctoMap
 from scene.objects import visualize_coordinate_frame, clear_debug_items, DebugPoints, Ground, URDF, load_object, DebugCoordinateFrame
 from viewpoints.viewpoint_proposal import generate_planar_spherical_cap_candidates, sample_views_from_hemisphere
 from viewpoints.viewpoint import Viewpoint, visualize_viewpoint, compute_viewpoint_joint_angles
-from viewpoints.viewpoint_selection import compute_information_gain
+from viewpoints.viewpoint_selection import compute_information_gain, compute_semantic_information_gain
 from bodies.planning import MotionPlanner
 from detection.fire_blight_detector import FireBlightDetector
 
@@ -41,10 +41,11 @@ NUM_RAYS = 50
 MAX_RANGE = 0.5
 MIN_RANGE = 0.05
 MISMATCH_PENALTY = 0.1
+CONFIDENCE_BOOST = 0.05
 ALPHA = 0.1 # Cost weight for utility calculation
 MIN_INFORMATION_GAIN = 0.1 # Minimum information gain to continue planning
 CONFIDENCE_THRESHOLD = 0.1
-BETA = 0.5  # Balance between exploration and investigation in IG calculation
+BETA = 5.0  # Higher beta values prioritize low confidence voxels more
 
 # ===== Main Script =====
 # Create environment and ground
@@ -109,6 +110,7 @@ camera_pos, camera_orient = camera.get_camera_pose()
 
 # Start the NBV planning loop
 print("\n=== Starting NBV Planning ===")
+input("Press Enter to begin...")
 
 # NBV planning iterations
 best_information_gain = np.inf
@@ -142,14 +144,15 @@ for iteration in range(MAX_ITERATIONS):
             rgb_image=img_rgb,
             detections=detections,
             background_label=-1,
-            background_confidence=0.5
+            background_confidence=CONFIDENCE_THRESHOLD
         )
         stats = semantic_octomap.add_semantic_point_cloud(
             point_cloud=points[valid_mask],
             labels=labels[valid_mask],
             confidences=confidences[valid_mask],
             sensor_origin=camera.camera_pos,
-            mismatch_penalty=MISMATCH_PENALTY
+            mismatch_penalty=MISMATCH_PENALTY,
+            confidence_boost=CONFIDENCE_BOOST
         )
         handles = semantic_octomap.visualize_semantic(
             min_confidence=CONFIDENCE_THRESHOLD,
@@ -161,14 +164,18 @@ for iteration in range(MAX_ITERATIONS):
         debug_id_handles.extend(handles)
 
     # Compute the viewpoints for the next best view
-    frontiers = semantic_octomap.find_frontiers(min_unknown_neighbors=1)
-    print(f"Found {len(frontiers)} frontiers")
+    """
+    Instead of clustering frontiers, we cluster the uncertain voxels (low confidence)
+    """
+    frontiers = semantic_octomap.get_uncertain_voxels(max_confidence=0.5)
+    print(f"Found {len(frontiers)} low-confidence voxels as frontiers")
     # frontiers_debug_ids = semantic_octomap.visualize_frontiers(frontiers, point_size=10.0)
-    # Cluster the frontiers
+    # input("Press Enter to continue...")
     clustered_frontiers = semantic_octomap.cluster_frontiers(frontiers, algorithm='kmeans', min_samples=3, eps=OCTOMAP_RESOLUTION,
-                                                             n_clusters=max(1, len(frontiers) // 40 if len(frontiers) // 40 <= 40 else 40))
+                                                             n_clusters=max(1, len(frontiers) // 20 if len(frontiers) // 20 <= 20 else 20))
     print(f"Clustered frontiers into {len(clustered_frontiers['cluster_centers'])} groups")
     # clustered_frontiers_debug_ids = semantic_octomap.visualize_frontier_clusters(clustered_frontiers, point_size=10)
+    # input("Press Enter to continue...")
     # Filter out the clusters that are too far to reach
     reachable_cluster_centers = []
     for cluster_center in clustered_frontiers["cluster_centers"]:
@@ -191,6 +198,7 @@ for iteration in range(MAX_ITERATIONS):
         )
         viewpoint_candidates.extend(new_viewpoint_candidates)
     print(f"Generated {len(viewpoint_candidates)} viewpoint candidates from frontier clusters")
+    # Create a partial Fibboni sphere around the 
     # Get viewpoints from planar spherical cap sampling too
     viewpoint_candidates += generate_planar_spherical_cap_candidates(
         position=init_position,
@@ -211,7 +219,7 @@ for iteration in range(MAX_ITERATIONS):
 
     # Compute information gain for each viewpoint
     for vp in filtered_viewpoint_candidates:
-        vp.information_gain = compute_information_gain(
+        vp.information_gain = compute_semantic_information_gain(
             viewpoint=vp, 
             scene_representation=semantic_octomap, 
             fov=CAMERA_FOV, 
@@ -220,7 +228,8 @@ for iteration in range(MAX_ITERATIONS):
             max_range=MAX_RANGE, 
             resolution=OCTOMAP_RESOLUTION, 
             num_rays=NUM_RAYS, 
-            roi=obj_roi
+            roi=obj_roi,
+            beta=BETA
         )
            
     # Compute the utility for each viewpoint
@@ -270,7 +279,7 @@ for iteration in range(MAX_ITERATIONS):
     # input("Press Enter to continue to next iteration...")    
 
 print("\nNBV planning demo complete.")
-semantic_octomap.save_semantic("volumetric_octomap.npz", "semantic_octomap.npz")
+semantic_octomap.save_semantic("semantic_octomap_points.npz", "semantic_octomap_labels.npz")
 
 # Keep running for visualization
 print("Press Ctrl+C to exit")

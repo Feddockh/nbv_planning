@@ -41,6 +41,7 @@ NUM_RAYS = 50
 MAX_RANGE = 0.5
 MIN_RANGE = 0.05
 MISMATCH_PENALTY = 0.1
+CONFIDENCE_BOOST = 0.05
 ALPHA = 0.1 # Cost weight for utility calculation
 MIN_INFORMATION_GAIN = 0.1 # Minimum information gain to continue planning
 CONFIDENCE_THRESHOLD = 0.1
@@ -108,6 +109,7 @@ camera_pos, camera_orient = camera.get_camera_pose()
 
 # Start the NBV planning loop
 print("\n=== Starting NBV Planning ===")
+input("Press Enter to begin...")
 
 # NBV planning iterations
 best_information_gain = np.inf
@@ -141,14 +143,15 @@ for iteration in range(MAX_ITERATIONS):
             rgb_image=img_rgb,
             detections=detections,
             background_label=-1,
-            background_confidence=0.5
+            background_confidence=CONFIDENCE_THRESHOLD
         )
         stats = semantic_octomap.add_semantic_point_cloud(
             point_cloud=points[valid_mask],
             labels=labels[valid_mask],
             confidences=confidences[valid_mask],
             sensor_origin=camera.camera_pos,
-            mismatch_penalty=MISMATCH_PENALTY
+            mismatch_penalty=MISMATCH_PENALTY,
+            confidence_boost=CONFIDENCE_BOOST
         )
         handles = semantic_octomap.visualize_semantic(
             min_confidence=CONFIDENCE_THRESHOLD,
@@ -207,6 +210,7 @@ for iteration in range(MAX_ITERATIONS):
             filtered_viewpoint_candidates.append(vp)
             # visualize_viewpoint(vp)
     print(f"Filtered to {len(filtered_viewpoint_candidates)} / {len(viewpoint_candidates)} viewpoints")
+    # input("Press Enter to compute information gain for viewpoints...")
 
     # Compute information gain for each viewpoint
     for vp in filtered_viewpoint_candidates:
@@ -269,7 +273,7 @@ for iteration in range(MAX_ITERATIONS):
     # input("Press Enter to continue to next iteration...")    
 
 print("\nNBV planning demo complete.")
-semantic_octomap.save_semantic("volumetric_octomap.npz", "semantic_octomap.npz")
+semantic_octomap.save_semantic("volumetric_octomap_points.npz", "volumetric_octomap_labels.npz")
 
 # Keep running for visualization
 print("Press Ctrl+C to exit")

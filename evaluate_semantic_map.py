@@ -208,7 +208,7 @@ class SemanticMapDistanceEvaluator:
         num_FN = len(results["FNs"])
         labeled_gts = [pt for pt in self.ground_truth["points"] if pt.get("label", None) is not None]
         total_gt = len(labeled_gts)
-        hit_rate = num_TP / total_gt if total_gt > 0 else 0.0
+        hit_rate = num_TP / (num_TP + num_FP) if (num_TP + num_FP) > 0 else 0.0
 
         print("\nSemantic Map Distance Evaluation Results:")
         print(f"  Total ground-truth points : {total_gt}")

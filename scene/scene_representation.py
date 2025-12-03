@@ -599,16 +599,21 @@ class SemanticOctoMap(OctoMap):
         return labels, confidences
     
     def add_semantic_point_cloud(self, point_cloud: np.ndarray, 
-                                 labels: np.ndarray, 
-                                 confidences: np.ndarray,
-                                 sensor_origin: np.ndarray,
-                                 max_range: float = -1.0,
-                                 lazy_eval: bool = False,
-                                 discretize: bool = True,
-                                 mismatch_penalty: float = 0.1):
+                             labels: np.ndarray, 
+                             confidences: np.ndarray,
+                             sensor_origin: np.ndarray,
+                             max_range: float = -1.0,
+                             lazy_eval: bool = False,
+                             discretize: bool = True,
+                             mismatch_penalty: float = 0.1,
+                             confidence_boost: float = 0.1) -> Dict:
         """
         Add a semantic point cloud to the octree with max-fusion update.
-        
+
+        This version first discretizes / groups the point cloud by voxel and
+        keeps only the highest-confidence label for each voxel, to avoid
+        over-boosting / over-penalizing voxels with many points.
+
         Args:
             point_cloud: Nx3 array of 3D points
             labels: N array of semantic class labels (integers)
@@ -617,83 +622,121 @@ class SemanticOctoMap(OctoMap):
             max_range: Maximum range for points (-1.0 = no limit)
             lazy_eval: If True, delay updates to inner nodes for efficiency
             discretize: If True, discretize points to voxel centers before insertion
-            mismatch_penalty: Penalty factor for label mismatch (default 0.1 = 10%)
-            
+                        (passed to volumetric add_point_cloud; semantic update always
+                        groups by voxel_key)
+            mismatch_penalty: Penalty factor for label mismatch
+            confidence_boost: Amount to boost confidence for matching labels
+
         Returns:
-            update_stats: Dict with statistics about semantic updates
+            stats: Dict with statistics about semantic updates
         """
         point_cloud = np.asarray(point_cloud, dtype=np.float64)
         labels = np.asarray(labels, dtype=np.int32)
         confidences = np.asarray(confidences, dtype=np.float64)
         
         if point_cloud.shape[0] != labels.shape[0] or point_cloud.shape[0] != confidences.shape[0]:
-            raise ValueError(f"Point cloud, labels, and confidences must have same length")
+            raise ValueError("Point cloud, labels, and confidences must have same length")
         
-        # First, update the volumetric occupancy (from base OctoMap)
-        success_count = self.add_point_cloud(point_cloud, sensor_origin, max_range, lazy_eval, discretize)
+        # 1) Update volumetric occupancy (base OctoMap)
+        success_count = self.add_point_cloud(
+            point_cloud, sensor_origin, max_range, lazy_eval, discretize
+        )
         
         # Track statistics
         stats = {
-            'total_points': len(point_cloud),
+            'total_points': int(point_cloud.shape[0]),
+            'unique_voxel_observations': 0,
             'new_voxels': 0,
             'updated_same_label': 0,
             'updated_different_label': 0,
-            'volumetric_insertions': success_count
+            'volumetric_insertions': success_count,
         }
-        
-        # Update semantic information using max-fusion
-        for i, point in enumerate(point_cloud):
 
-            # Check if the point is within max_range
+        # 2) Group points by voxel and keep the highest-confidence observation
+        #    for each voxel.
+        voxel_observations = {}  # voxel_key -> {'label': int, 'confidence': float}
+
+        for i, point in enumerate(point_cloud):
+            # Max range filter for semantics
             if max_range > 0.0:
                 distance = np.linalg.norm(point - sensor_origin)
                 if distance > max_range:
-                    continue  # Skip points beyond max range
+                    continue
 
-            # Get voxel key
             voxel_key = self._voxel_key(point)
             new_label = int(labels[i])
             new_confidence = float(confidences[i])
-            
+
             # Clamp confidence to [0, 1]
-            new_confidence = np.clip(new_confidence, 0.0, 1.0)
-            
+            new_confidence = float(np.clip(new_confidence, 0.0, 1.0))
+
+            existing = voxel_observations.get(voxel_key, None)
+            if existing is None or new_confidence > existing['confidence']:
+                voxel_observations[voxel_key] = {
+                    'label': new_label,
+                    'confidence': new_confidence,
+                }
+
+        stats['unique_voxel_observations'] = len(voxel_observations)
+
+        # 3) Max-fusion semantic update, now done once per voxel
+        for voxel_key, obs in voxel_observations.items():
+            new_label = obs['label']
+            new_confidence = obs['confidence']
+
             if voxel_key not in self.semantic_map:
                 # No prior semantic information - directly assign
                 self.semantic_map[voxel_key] = {
                     'label': new_label,
-                    'confidence': new_confidence
+                    'confidence': new_confidence,
                 }
                 stats['new_voxels'] += 1
             else:
-                # Max-fusion update
+                """
+                Max-fusion update
+                If new label == previous label:
+                    p_s(x) = (p_s_prev(x) + p_s_new(x))/2 + confidence_boost
+                Else:
+                    Choose label with higher confidence, apply mismatch penalty
+
+                Note: because we now fuse **once per voxel** per call, rather than
+                per point, the boost and penalty cannot explode due to very dense
+                point clouds in the same voxel.
+                """
                 prev_label = self.semantic_map[voxel_key]['label']
                 prev_confidence = self.semantic_map[voxel_key]['confidence']
-                
+
                 if new_label == prev_label:
-                    # Same label - average the confidence scores
+                    # Same label - average the confidence scores + small boost
                     updated_confidence = (prev_confidence + new_confidence) / 2.0
+                    updated_confidence = float(
+                        np.clip(updated_confidence + confidence_boost, 0.0, 1.0)
+                    )
                     self.semantic_map[voxel_key] = {
                         'label': new_label,
-                        'confidence': updated_confidence
+                        'confidence': updated_confidence,
                     }
                     stats['updated_same_label'] += 1
                 else:
                     # Different labels - choose the one with higher confidence
-                    # Apply penalty to the chosen confidence
                     if new_confidence > prev_confidence:
                         chosen_label = new_label
-                        chosen_confidence = new_confidence * (1.0 - mismatch_penalty)
+                        chosen_confidence = new_confidence
                     else:
                         chosen_label = prev_label
-                        chosen_confidence = prev_confidence * (1.0 - mismatch_penalty)
-                    
+                        chosen_confidence = prev_confidence
+
+                    # Apply mismatch penalty to the chosen label's confidence
+                    chosen_confidence = float(
+                        np.clip(chosen_confidence * (1.0 - mismatch_penalty), 0.0, 1.0)
+                    )
+
                     self.semantic_map[voxel_key] = {
                         'label': chosen_label,
-                        'confidence': chosen_confidence
+                        'confidence': chosen_confidence,
                     }
                     stats['updated_different_label'] += 1
-        
+
         return stats
     
     def get_semantic_info(self, point: np.ndarray) -> Optional[Dict]:
@@ -937,7 +980,7 @@ class SemanticOctoMap(OctoMap):
                 
                 if len(free_voxels) > 0:
                     free_voxels = np.array(free_voxels)
-                    handles = DebugPoints(free_voxels, points_rgb=free_color, size=point_size*0.9)
+                    handles = DebugPoints(free_voxels, points_rgb=free_color, size=point_size*0.5)
                     if isinstance(handles, list):
                         debug_handles.extend(handles)
                     else:

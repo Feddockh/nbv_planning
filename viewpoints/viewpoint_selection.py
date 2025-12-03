@@ -130,3 +130,123 @@ def compute_information_gain(
 
     # Return average unknown voxels per ray
     return float(total_unknown / num_rays_cast) if num_rays_cast > 0 else 0.0
+
+def compute_semantic_information_gain(
+    viewpoint: Viewpoint,
+    scene_representation,  # Should be SemanticOctoMap
+    fov: float = 60.0,
+    width: int = 640,
+    height: int = 480,
+    max_range: float = 3.0,
+    resolution: float = 0.1,
+    num_rays: int = -1,
+    roi: Optional[ROI] = None,
+    beta: float = 1.0
+) -> float:
+    """
+    Compute semantic information gain for a viewpoint.
+    
+    Combines volumetric uncertainty (unknown voxels) with semantic uncertainty
+    (low confidence in semantic labels).
+    
+    For each ray:
+    - Count unknown voxels (volumetric uncertainty)
+    - Add (1 - confidence) * beta for occupied voxels with semantic labels
+    
+    SIG = (1/|R|) * sum_r [# unknown voxels + beta * sum((1 - confidence))]
+    
+    Args:
+        viewpoint (Viewpoint): The candidate viewpoint.
+        scene_representation: The semantic octomap (SemanticOctoMap).
+        fov (float): Camera horizontal field of view in degrees.
+        width (int): Image width in pixels.
+        height (int): Image height in pixels.
+        max_range (float): Maximum sensor range in meters.
+        resolution (float): Sampling resolution along each ray in meters.
+        num_rays (int): Number of rays to cast (if -1, use all pixels).
+        roi (ROI): Optional region of interest to constrain counting.
+        beta (float): Weight for semantic uncertainty contribution (0=volumetric only).
+
+    Returns:
+        float: The average semantic information gain per ray.
+    """
+
+    if width <= 0 or height <= 0 or max_range <= 0 or resolution <= 0:
+        return 0.0
+
+    # Determine pixel stride based on desired ray count
+    stride_u, stride_v = _compute_ray_strides(width, height, num_rays)
+
+    # Camera extrinsics
+    R_wc = _quat_to_rotmat_xyzw(np.asarray(viewpoint.orientation, dtype=np.float64))
+
+    hfov = np.deg2rad(float(fov))
+    focal = (width / 2.0) / np.tan(hfov / 2.0)
+    cx = (width - 1) * 0.5
+    cy = (height - 1) * 0.5
+
+    # Octomap access
+    tree = scene_representation.octree
+    max_depth = int(tree.getTreeDepth())
+
+    total_gain = 0.0
+    num_rays_cast = 0
+    
+    for v in range(0, height, stride_v):
+        for u in range(0, width, stride_u):
+            # Ray in camera frame
+            x = (u - cx) / focal
+            y = (v - cy) / focal
+            ray_cam = np.array([x, y, 1.0], dtype=np.float32)
+            ray_cam /= np.linalg.norm(ray_cam)
+
+            # Transform to world frame
+            ray_world = R_wc @ ray_cam
+            ray_world /= np.linalg.norm(ray_world)
+
+            # March along the ray
+            ray_gain = 0.0
+            prev_point_in_roi = False
+            
+            for i in range(0, int(max_range / resolution)):
+                t = i * resolution
+                point = np.asarray(viewpoint.position, dtype=np.float32) + t * ray_world
+
+                # Update ROI status
+                current_in_roi = roi.contains(point)
+                
+                # End ray if exiting ROI
+                if not current_in_roi and prev_point_in_roi:
+                    break
+                prev_point_in_roi = current_in_roi
+
+                # ROI gating
+                if current_in_roi:
+                    # Check voxel state
+                    node = tree.search(point, depth=max_depth)
+                    
+                    if node is None:
+                        # Unknown voxel - volumetric uncertainty
+                        ray_gain += 1.0
+                    else:
+                        # Known voxel
+                        if tree.isNodeOccupied(node):
+                            # Occupied voxel - check semantic uncertainty
+                            voxel_key = scene_representation._voxel_key(point)
+                            semantic_info = scene_representation.semantic_map.get(voxel_key)
+                            
+                            if semantic_info is not None:
+                                # Add semantic uncertainty: (1 - confidence) * beta
+                                confidence = semantic_info['confidence']
+                                semantic_uncertainty = (1.0 - confidence) * beta
+                                ray_gain += semantic_uncertainty
+                            
+                            # Stop ray at occupied voxel
+                            break
+                        # If free, continue marching
+
+            total_gain += ray_gain
+            num_rays_cast += 1
+
+    # Return average gain per ray
+    return float(total_gain / num_rays_cast) if num_rays_cast > 0 else 0.0
