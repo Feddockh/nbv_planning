@@ -46,3 +46,11 @@ def quat_to_normal(q: np.ndarray) -> np.ndarray:
     forward_cam = np.array([0, 0, 1])
     normal_world = r.apply(forward_cam)
     return normal_world / np.linalg.norm(normal_world)
+
+def quat_angle(q1, q2):
+    q1 = np.array(q1, dtype=float)
+    q2 = np.array(q2, dtype=float)
+    q1 /= np.linalg.norm(q1)
+    q2 /= np.linalg.norm(q2)
+    dot = np.clip(np.abs(np.dot(q1, q2)), -1.0, 1.0)
+    return 2 * np.arccos(dot)

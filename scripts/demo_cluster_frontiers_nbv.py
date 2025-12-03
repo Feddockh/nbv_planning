@@ -1,8 +1,7 @@
 """
 Next-Best-View Planning Demo
 
-Simple demonstration of active perception using octomap for volumetric mapping.
-The robot explores the scene by moving its camera to maximize information gain.
+Simple demonstration of active perception with frontier clustering for viewpoint candidates
 """
 
 import sys

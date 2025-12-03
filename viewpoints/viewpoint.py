@@ -1,11 +1,12 @@
 import numpy as np
 from dataclasses import dataclass
+import pybullet as p
 
 from bodies.robot import Robot
 from vision import RobotCamera
 from utils import get_rotation_matrix, multiply_transforms
 from scene.objects import DebugCoordinateFrame, DebugPoints
-from utils import get_euler, get_quaternion
+from utils import get_euler, get_quaternion, quat_angle
 
 
 @dataclass
@@ -66,6 +67,8 @@ def compute_viewpoint_joint_angles(robot: Robot, viewpoint: Viewpoint, robot_cam
         camera_offset_pos_inv,
         camera_offset_orient_inv
     )
+
+    # visualize_viewpoint(Viewpoint(position=ee_pos, orientation=ee_orient))
     
     # Solve inverse kinematics to get joint angles
     joint_angles = robot.ik(
@@ -74,7 +77,23 @@ def compute_viewpoint_joint_angles(robot: Robot, viewpoint: Viewpoint, robot_cam
         target_orient=ee_orient,
         use_current_joint_angles=True
     )
+
+    pos_err, ang_err = compute_fk_error(robot, joint_angles, ee_pos, ee_orient, robot.end_effector)
+    print(f"pos_err = {pos_err:.4f}, ang_err = {np.degrees(ang_err):.2f} deg")
+
+    if pos_err > 0.01 or ang_err > np.radians(5):
+        print("Warning: High FK error for computed joint angles!")
+        joint_angles = None
+        
     return joint_angles
+
+# TODO: Move this elsewhere
+def compute_fk_error(robot, joint_angles, target_pos, target_orient, link_index):
+    robot.control(joint_angles, set_instantly=True)
+    ee_pos, ee_orient = robot.get_link_pos_orient(robot.end_effector)
+    pos_err = np.linalg.norm(np.array(ee_pos) - np.array(target_pos))
+    ang_err = quat_angle(ee_orient, target_orient)
+    return pos_err, ang_err
 
 def visualize_viewpoint(viewpoint: Viewpoint, local_env=None, coordinate_frame: bool = True):
     debug_ids = []

@@ -1,7 +1,7 @@
 """
 Next-Best-View Planning Demo
 
-Simple demonstration of active perception using octomap for volumetric mapping.
+Simple demonstration of active perception using octomap for semantic mapping.
 The robot explores the scene by moving its camera to maximize information gain.
 """
 
@@ -44,6 +44,7 @@ MISMATCH_PENALTY = 0.1
 ALPHA = 0.1 # Cost weight for utility calculation
 MIN_INFORMATION_GAIN = 0.1 # Minimum information gain to continue planning
 CONFIDENCE_THRESHOLD = 0.1
+BETA = 0.5  # Balance between exploration and investigation in IG calculation
 
 # ===== Main Script =====
 # Create environment and ground

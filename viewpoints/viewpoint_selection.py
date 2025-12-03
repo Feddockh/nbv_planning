@@ -104,25 +104,26 @@ def compute_information_gain(
                 t = i * resolution
                 point = np.asarray(viewpoint.position, dtype=np.float32) + t * ray_world
 
+                # Update ROI status before checking
+                current_in_roi = roi.contains(point)
+                
                 # End ray if the current point is outside the ROI and the previous point was inside (single convex ROI)
-                if not roi.contains(point) and prev_point_in_roi:
+                if not current_in_roi and prev_point_in_roi:
                     break
-                prev_point_in_roi = roi.contains(point)
+                prev_point_in_roi = current_in_roi
 
-                # ROI gating: skip points outside ROI
-                if not roi.contains(point):
-                    continue # Skips the rest of the loop
-
-                # Check voxel state
-                node = tree.search(point, depth=max_depth)
-                if node is None:
-                    # Unknown voxel - increment counter
-                    unknown_count += 1
-                else:
-                    # Known voxel: if occupied, stop the ray
-                    if tree.isNodeOccupied(node):
-                        break
-                    # If free, continue marching
+                # ROI gating: only count points inside the ROI
+                if current_in_roi:
+                    # Check voxel state
+                    node = tree.search(point, depth=max_depth)
+                    if node is None:
+                        # Unknown voxel - increment counter
+                        unknown_count += 1
+                    else:
+                        # Known voxel: if occupied, stop the ray
+                        if tree.isNodeOccupied(node):
+                            break
+                        # If free, continue marching
 
             total_unknown += unknown_count
             num_rays_cast += 1

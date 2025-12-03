@@ -359,6 +359,17 @@ class Body:
                 p.resetJointState(self.body, jointIndex=j, targetValue=self.upper_limits[j], targetVelocity=0, physicsClientId=self.id)
 
     def ik(self, target_joint, target_pos, target_orient=None, max_iterations=1000, use_current_joint_angles=False, randomize_limits=False):
+        """
+        Compute inverse kinematics for the body to reach a target position and orientation with a specific joint.
+
+        Args:
+            target_joint (int): The index of the joint to reach the target position/orientation.
+            target_pos (list or np.array): The target position [x, y, z].
+            target_orient (list or np.array, optional): The target orientation as a quaternion [x, y, z, w]. If None, only position is considered.
+            max_iterations (int, optional): Maximum number of iterations for the IK solver. Default is 1000.
+            use_current_joint_angles (bool, optional): If True, use the current joint angles as the rest poses for IK. Default is False.
+            randomize_limits (bool, optional): If True, randomize the IK joint limits. Default is False.
+        """
         ik_lower_limits = self.ik_lower_limits if not randomize_limits else np.random.uniform(0, self.ik_lower_limits)
         ik_upper_limits = self.ik_upper_limits if not randomize_limits else np.random.uniform(0, self.ik_upper_limits)
         ik_joint_ranges = ik_upper_limits - ik_lower_limits
@@ -374,7 +385,7 @@ class Body:
         # print('Rest:', ik_rest_poses)
 
         if target_orient is not None:
-            ik_joint_poses = np.array(p.calculateInverseKinematics(self.body, target_joint, targetPosition=target_pos, targetOrientation=self.get_quaternion(target_orient), lowerLimits=ik_lower_limits.tolist(), upperLimits=ik_upper_limits.tolist(), jointRanges=ik_joint_ranges.tolist(), restPoses=ik_rest_poses.tolist(), maxNumIterations=max_iterations, physicsClientId=self.id))
+            ik_joint_poses = np.array(p.calculateInverseKinematics(self.body, target_joint, targetPosition=target_pos, targetOrientation=target_orient, lowerLimits=ik_lower_limits.tolist(), upperLimits=ik_upper_limits.tolist(), jointRanges=ik_joint_ranges.tolist(), restPoses=ik_rest_poses.tolist(), maxNumIterations=max_iterations, physicsClientId=self.id))
         else:
             ik_joint_poses = np.array(p.calculateInverseKinematics(self.body, target_joint, targetPosition=target_pos, lowerLimits=ik_lower_limits.tolist(), upperLimits=ik_upper_limits.tolist(), jointRanges=ik_joint_ranges.tolist(), restPoses=ik_rest_poses.tolist(), maxNumIterations=max_iterations, physicsClientId=self.id))
 

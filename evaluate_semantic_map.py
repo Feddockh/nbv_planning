@@ -1,337 +1,400 @@
 """
-Evaluate Semantic OctoMap Accuracy
+Semantic OctoMap Distance Evaluator (3D only)
 
-This script loads ground truth points and compares them against a semantic octomap
-to measure accuracy metrics such as:
-- Label accuracy (correct class prediction)
-- Confidence scores for correct/incorrect predictions
-- Confusion matrix
-- Per-class precision, recall, F1-score
+For each ground-truth point:
+  - Find nearest semantic voxel of the same label.
+  - Compute Euclidean distance.
+  - If distance <= threshold -> hit, else miss.
+
+Metrics:
+  - Hit rate
+  - Mean / median distance for hits
+  - Distance-weighted confidence score per GT point
+
+3D visualization:
+  - Blue spheres  : ground-truth lesion points
+  - Green spheres : matched semantic voxels (hits)
+  - Red spheres   : nearest semantic voxels that are misses
 """
 
 import os
 import json
+from typing import Dict, List, Optional, Tuple, Any
+
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from collections import defaultdict
-from typing import Dict, List, Tuple
 
 import env
-from utils import get_quaternion
-from scene.roi import RectangleROI
-from scene.objects import URDF, Ground, load_object, DebugCoordinateFrame
+from scene.objects import URDF, Ground, load_object, DebugPoints
 from scene.scene_representation import SemanticOctoMap
 
 
-class SemanticMapEvaluator:
-    def __init__(self, semantic_map: SemanticOctoMap, ground_truth_file: str):
+class SemanticMapDistanceEvaluator:
+    def __init__(
+        self,
+        semantic_map: SemanticOctoMap,
+        ground_truth_file: str,
+        distance_threshold: float = 0.05,
+        score_radius: Optional[float] = None,
+        min_confidence: float = 0.0,
+    ):
         """
-        Initialize evaluator with a semantic map and ground truth points.
-        
         Args:
-            semantic_map: SemanticOctoMap instance to evaluate
-            ground_truth_file: Path to JSON file with ground truth points
+            semantic_map: SemanticOctoMap instance (already built or loaded).
+            ground_truth_file: Path to JSON file with ground truth points.
+            distance_threshold: Max distance (m) for hit vs miss.
+            score_radius: Radius (m) for distance-weighted confidence score.
+                          If None, defaults to distance_threshold.
+            min_confidence: Minimum semantic confidence for voxels to be considered.
         """
         self.semantic_map = semantic_map
-        self.ground_truth = self.load_ground_truth(ground_truth_file)
-        self.results = []
-        
-    def load_ground_truth(self, filename: str) -> Dict:
-        """Load ground truth points from JSON file."""
-        with open(filename, 'r') as f:
+        self.distance_threshold = float(distance_threshold)
+        self.score_radius = float(score_radius) if score_radius is not None else float(
+            distance_threshold
+        )
+        self.min_confidence = float(min_confidence)
+
+        self.ground_truth = self._load_ground_truth(ground_truth_file)
+        self.results: List[Dict] = []
+
+    def _load_ground_truth(self, filename: str) -> Dict:
+        with open(filename, "r") as f:
             data = json.load(f)
         print(f"Loaded {data['num_points']} ground truth points from {filename}")
         return data
     
+    def _get_all_predictions(self) -> List[Tuple[np.ndarray, float, int]]:
+        """
+        Returns:
+            List of (coord, confidence, label) for all *semantic prediction voxels*.
+            Free / unknown / unlabeled voxels are excluded.
+        """
+        preds = []
+        for (x, y, z), info in self.semantic_map.semantic_map.items():
+
+            # Skip voxels with no semantic class assigned
+            if info["label"] is None or info["label"] < 0:
+                continue
+
+            # Skip voxels below minimum confidence
+            if info["confidence"] < self.min_confidence:
+                continue
+
+            coord = np.array([x, y, z], dtype=float)
+            conf = float(info["confidence"])
+            label = int(info["label"])
+            preds.append((coord, conf, label))
+
+        return preds
+    
+    def _get_predictions_with_label(self, label: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns:
+            coords: (N,3) voxel centers for this label
+            confs:  (N,)  confidences for those voxels
+        """
+        coords = []
+        confs = []
+        for (x, y, z), info in self.semantic_map.semantic_map.items():
+            if info["label"] == label and info["confidence"] >= self.min_confidence:
+                coords.append([x, y, z])
+                confs.append(info["confidence"])
+        if not coords:
+            return np.zeros((0, 3)), np.zeros((0,), dtype=float)
+        return np.array(coords, dtype=float), np.array(confs, dtype=float)
+    
+    def _lookup_match_coord(self, matches: List[Tuple[Dict, np.ndarray]], coord: np.ndarray) -> int:
+        for i, (matched_pt, matched_coord) in enumerate(matches):
+            if np.array_equal(matched_coord, coord):
+                return i
+        return -1
+    
+    def _lookup_match_gt(self, matches: List[Tuple[Dict, np.ndarray]], gt_pt: Dict) -> int:
+        for i, (matched_pt, matched_coord) in enumerate(matches):
+            if matched_pt["index"] == gt_pt["index"]:
+                return i
+        return -1
+
     def evaluate(self) -> Dict:
         """
-        Evaluate the semantic map against ground truth points.
-        
+        For each labeled GT point:
+          - Get voxels of same label with confidences.
+          - Compute nearest distance (for hit/miss).
+          - Compute distance-weighted confidence score S(g).
+
         Returns:
-            Dictionary containing evaluation metrics
+            metrics dict with hit_rate, distances, semantic scores, etc.
         """
-        print("\n" + "="*60)
-        print("EVALUATING SEMANTIC MAP")
-        print("="*60)
-        
-        results = []
-        
-        for pt_data in self.ground_truth['points']:
-            position = np.array(pt_data['position'])
-            gt_label = pt_data.get('label', None)
-            gt_class = pt_data.get('class_name', None)
-            
-            # Query semantic map
-            semantic_info = self.semantic_map.get_semantic_info(position)
-            
-            if semantic_info is None:
-                pred_label = None
-                pred_confidence = 0.0
-                pred_class = "unknown"
+
+        results: Dict[str, Any] = {}
+        results["TPs"] = []
+        results["FPs"] = []
+        results["FNs"] = []
+        results["TP_distances"] = []
+        results["FP_distances"] = []
+        results["TP_confidences"] = []
+        results["FP_confidences"] = []
+
+        # Pre-filter labeled GTs
+        labeled_gts = [
+            pt for pt in self.ground_truth["points"]
+            if pt.get("label", None) is not None
+        ]
+
+        # Iterate through all predictions once
+        all_preds = self._get_all_predictions()
+        for coord, conf, pred_label in all_preds:
+            # GTs with the same label as this prediction
+            same_label_gts = [
+                pt for pt in labeled_gts
+                if pt.get("label", None) == pred_label
+            ]
+
+            if same_label_gts:
+                gt_positions = np.array(
+                    [pt["position"] for pt in same_label_gts],
+                    dtype=float,
+                )
+                dists = np.linalg.norm(gt_positions - coord[None, :], axis=1)
+                min_idx = int(np.argmin(dists))
+                d = float(dists[min_idx])
+                closest_gt = same_label_gts[min_idx]
             else:
-                pred_label = semantic_info['label']
-                pred_confidence = semantic_info['confidence']
-                pred_class = self.semantic_map.class_names.get(pred_label, f"class_{pred_label}")
-            
-            # Check occupancy
-            is_occupied = self.semantic_map.is_occupied(position)
-            
-            result = {
-                'index': pt_data['index'],
-                'position': position.tolist(),
-                'gt_label': gt_label,
-                'gt_class': gt_class,
-                'pred_label': pred_label,
-                'pred_class': pred_class,
-                'pred_confidence': pred_confidence,
-                'is_occupied': is_occupied,
-                'correct': (gt_label == pred_label) if gt_label is not None else None
-            }
-            
-            results.append(result)
-            
-            # Print result
-            status = "✓" if result['correct'] else "✗" if result['correct'] is not None else "?"
-            print(f"{status} Point {pt_data['index'] + 1}: "
-                  f"GT={gt_class}({gt_label}) | "
-                  f"Pred={pred_class}({pred_label}, conf={pred_confidence:.2f}) | "
-                  f"Occupied={is_occupied}")
+                # No GT of this label
+                d = float("nan")
+                closest_gt = None
+
+            if closest_gt is not None and d <= self.distance_threshold:
+                # True Positive: prediction close to a GT of same label
+                results["TPs"].append((closest_gt, coord))
+                results["TP_distances"].append(d)
+                results["TP_confidences"].append(conf)
+            else:
+                # False Positive: no close GT of same label
+                results["FPs"].append(coord)
+                results["FP_distances"].append(d)
+                results["FP_confidences"].append(conf)
+
+        # Finally, compute the ground truth points that were not matched at all (FN)
+        for gt_pt in self.ground_truth["points"]:
+            gt_label = gt_pt.get("label", None)
+            # Skip unlabeled points
+            if gt_label is None:
+                continue
+            # Check if this GT point was matched
+            matched_idx = self._lookup_match_gt(results["TPs"], gt_pt)
+            if matched_idx == -1:
+                # Not matched, add to FN list
+                results["FNs"].append(gt_pt)
+
+        # Compute the average TP and FP distances
+        results["TP_avg_distance"] = np.mean(results["TP_distances"]) if results["TP_distances"] else float('nan')
+        results["FP_avg_distance"] = np.mean(results["FP_distances"]) if results["FP_distances"] else float('nan')
+
+        # Compute the average TP and FP confidences
+        results["TP_avg_confidence"] = np.mean(results["TP_confidences"]) if results["TP_confidences"] else float('nan')
+        results["FP_avg_confidence"] = np.mean(results["FP_confidences"]) if results["FP_confidences"] else float('nan')
+
+        # Compute the max TP and FP confidences
+        results["TP_max_confidence"] = max(results["TP_confidences"]) if results["TP_confidences"] else float('nan')
+        results["FP_max_confidence"] = max(results["FP_confidences"]) if results["FP_confidences"] else float('nan')
         
         self.results = results
-        
-        # Compute metrics
-        metrics = self.compute_metrics()
-        
-        return metrics
+        self._print_results(results)
+        return results
     
-    def compute_metrics(self) -> Dict:
-        """Compute evaluation metrics from results."""
-        print("\n" + "="*60)
-        print("METRICS")
-        print("="*60)
-        
-        # Filter results with ground truth labels
-        labeled_results = [r for r in self.results if r['gt_label'] is not None]
-        
-        if len(labeled_results) == 0:
-            print("No labeled ground truth points to evaluate")
-            return {}
-        
-        # Overall accuracy
-        correct = sum(1 for r in labeled_results if r['correct'])
-        total = len(labeled_results)
-        accuracy = correct / total if total > 0 else 0.0
-        
-        # Points with predictions
-        predicted = [r for r in labeled_results if r['pred_label'] is not None]
-        unknown = [r for r in labeled_results if r['pred_label'] is None]
-        
-        # Average confidence for correct/incorrect
-        correct_preds = [r for r in predicted if r['correct']]
-        incorrect_preds = [r for r in predicted if not r['correct']]
-        
-        avg_conf_correct = np.mean([r['pred_confidence'] for r in correct_preds]) if correct_preds else 0.0
-        avg_conf_incorrect = np.mean([r['pred_confidence'] for r in incorrect_preds]) if incorrect_preds else 0.0
-        
-        # Per-class metrics
-        class_metrics = self.compute_per_class_metrics(labeled_results)
-        
-        metrics = {
-            'total_points': total,
-            'correct_predictions': correct,
-            'accuracy': accuracy,
-            'predicted_points': len(predicted),
-            'unknown_points': len(unknown),
-            'avg_confidence_correct': avg_conf_correct,
-            'avg_confidence_incorrect': avg_conf_incorrect,
-            'class_metrics': class_metrics
-        }
-        
-        # Print summary
-        print(f"Total points: {total}")
-        print(f"Correct predictions: {correct}/{total} ({accuracy*100:.1f}%)")
-        print(f"Points with predictions: {len(predicted)}")
-        print(f"Points without predictions (unknown): {len(unknown)}")
-        print(f"Avg confidence (correct): {avg_conf_correct:.3f}")
-        print(f"Avg confidence (incorrect): {avg_conf_incorrect:.3f}")
-        
-        print("\nPer-class metrics:")
-        for class_name, metrics_dict in class_metrics.items():
-            print(f"  {class_name}:")
-            print(f"    Precision: {metrics_dict['precision']:.3f}")
-            print(f"    Recall: {metrics_dict['recall']:.3f}")
-            print(f"    F1-score: {metrics_dict['f1']:.3f}")
-        
-        return metrics
-    
-    def compute_per_class_metrics(self, results: List[Dict]) -> Dict:
-        """Compute precision, recall, F1 per class."""
-        class_metrics = {}
-        
-        # Get all unique classes
-        all_classes = set()
-        for r in results:
-            if r['gt_class']:
-                all_classes.add(r['gt_class'])
-            if r['pred_class'] and r['pred_class'] != 'unknown':
-                all_classes.add(r['pred_class'])
-        
-        for class_name in all_classes:
-            # True positives: predicted this class and was correct
-            tp = sum(1 for r in results if r['pred_class'] == class_name and r['gt_class'] == class_name)
-            
-            # False positives: predicted this class but was wrong
-            fp = sum(1 for r in results if r['pred_class'] == class_name and r['gt_class'] != class_name)
-            
-            # False negatives: should have predicted this class but didn't
-            fn = sum(1 for r in results if r['gt_class'] == class_name and r['pred_class'] != class_name)
-            
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-            
-            class_metrics[class_name] = {
-                'precision': precision,
-                'recall': recall,
-                'f1': f1,
-                'tp': tp,
-                'fp': fp,
-                'fn': fn
-            }
-        
-        return class_metrics
-    
-    def plot_confusion_matrix(self, save_path: str = None):
-        """Plot confusion matrix."""
-        # Get labeled results
-        labeled_results = [r for r in self.results if r['gt_label'] is not None]
-        
-        if len(labeled_results) == 0:
-            print("No labeled data to plot confusion matrix")
+    def _print_results(self, results: Dict):
+        num_TP = len(results["TPs"])
+        num_FP = len(results["FPs"])
+        num_FN = len(results["FNs"])
+        labeled_gts = [pt for pt in self.ground_truth["points"] if pt.get("label", None) is not None]
+        total_gt = len(labeled_gts)
+        hit_rate = num_TP / total_gt if total_gt > 0 else 0.0
+
+        print("\nSemantic Map Distance Evaluation Results:")
+        print(f"  Total ground-truth points : {total_gt}")
+        print(f"  Total predictions         : {num_TP + num_FP}")
+        print(f"  True Positives (hits)     : {num_TP}")
+        print(f"  False Positives (misses)  : {num_FP}")
+        print(f"  False Negatives           : {num_FN}")
+        print(f"  Hit Rate                  : {hit_rate*100:.2f}%")
+        print(f"  Avg TP Distance (m)       : {results['TP_avg_distance']:.4f}")
+        print(f"  Avg FP Distance (m)       : {results['FP_avg_distance']:.4f}")
+        print(f"  Avg TP Confidence         : {results['TP_avg_confidence']:.4f}")
+        print(f"  Avg FP Confidence         : {results['FP_avg_confidence']:.4f}")
+        print(f"  Max TP Confidence         : {results['TP_max_confidence']:.4f}" if not np.isnan(results['TP_max_confidence']) else "  Max TP Confidence        : N/A")
+        print(f"  Max FP Confidence         : {results['FP_max_confidence']:.4f}" if not np.isnan(results['FP_max_confidence']) else "  Max FP Confidence        : N/A")
+
+    def visualize_matches_3d(
+        self,
+        gt_color=(0.0, 0.0, 1.0),
+        hit_color=(0.0, 1.0, 0.0),
+        miss_color=(1.0, 0.0, 0.0),
+        gt_size=0.01,
+        voxel_size=0.01,
+    ):
+        """
+        Visualize in 3D (PyBullet) using DebugPoints:
+
+        - Ground-truth lesion points: blue spheres
+        - Matched semantic voxels (hits): green spheres
+        - Unmatched prediction voxels (FPs): red spheres
+        """
+        if not self.results:
+            print("No evaluation results found. Run evaluate() first.")
             return
-        
-        # Get class names
-        all_classes = sorted(set(
-            [r['gt_class'] for r in labeled_results] +
-            [r['pred_class'] for r in labeled_results if r['pred_class'] != 'unknown']
-        ))
-        
-        # Add 'unknown' for predictions without semantic info
-        all_classes_with_unknown = all_classes + ['unknown']
-        n_classes = len(all_classes_with_unknown)
-        
-        # Build confusion matrix
-        cm = np.zeros((n_classes, n_classes), dtype=int)
-        class_to_idx = {cls: i for i, cls in enumerate(all_classes_with_unknown)}
-        
-        for r in labeled_results:
-            gt_idx = class_to_idx[r['gt_class']]
-            pred_class = r['pred_class'] if r['pred_class'] else 'unknown'
-            pred_idx = class_to_idx[pred_class]
-            cm[gt_idx, pred_idx] += 1
-        
-        # Plot
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=all_classes_with_unknown,
-                    yticklabels=all_classes_with_unknown,
-                    cbar_kws={'label': 'Count'})
-        plt.xlabel('Predicted Class')
-        plt.ylabel('Ground Truth Class')
-        plt.title('Semantic Map Confusion Matrix')
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved confusion matrix to {save_path}")
-        
-        plt.show()
-    
-    def plot_confidence_distribution(self, save_path: str = None):
-        """Plot confidence score distributions."""
-        labeled_results = [r for r in self.results if r['gt_label'] is not None and r['pred_label'] is not None]
-        
-        if len(labeled_results) == 0:
-            print("No predictions to plot confidence distribution")
+
+        # Labeled GT points
+        gt_pts = [
+            pt for pt in self.ground_truth["points"]
+            if pt.get("label", None) is not None
+        ]
+        if not gt_pts:
+            print("No labeled ground truth points to visualize.")
             return
-        
-        correct_conf = [r['pred_confidence'] for r in labeled_results if r['correct']]
-        incorrect_conf = [r['pred_confidence'] for r in labeled_results if not r['correct']]
-        
-        plt.figure(figsize=(10, 6))
-        
-        if correct_conf:
-            plt.hist(correct_conf, bins=20, alpha=0.6, label='Correct', color='green', edgecolor='black')
-        if incorrect_conf:
-            plt.hist(incorrect_conf, bins=20, alpha=0.6, label='Incorrect', color='red', edgecolor='black')
-        
-        plt.xlabel('Confidence Score')
-        plt.ylabel('Count')
-        plt.title('Confidence Score Distribution')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved confidence distribution to {save_path}")
-        
-        plt.show()
-    
-    def save_results(self, filename: str):
-        """Save evaluation results to JSON."""
-        data = {
-            'ground_truth_file': self.ground_truth,
-            'results': self.results,
-            'metrics': self.compute_metrics()
-        }
-        
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        print(f"\nSaved evaluation results to {filename}")
+
+        gt_positions = np.array([pt["position"] for pt in gt_pts], dtype=float)
+
+        # Hit voxels (TPs store (gt_pt, coord))
+        hit_voxels = [coord for (gt_pt, coord) in self.results.get("TPs", [])]
+        hit_voxels = np.array(hit_voxels, dtype=float) if hit_voxels else np.zeros((0, 3))
+
+        # Miss voxels (FPs store just coord)
+        miss_voxels = list(self.results.get("FPs", []))
+        miss_voxels = np.array(miss_voxels, dtype=float) if miss_voxels else np.zeros((0, 3))
+
+        debug_handles = []
+
+        # 1) Ground-truth lesion points (blue)
+        if gt_positions.size > 0:
+            h = DebugPoints(
+                gt_positions,
+                points_rgb=list(gt_color),
+                size=gt_size,
+            )
+            if isinstance(h, list):
+                debug_handles.extend(h)
+            else:
+                debug_handles.append(h)
+
+        # 2) Hit voxels (green)
+        if hit_voxels.size > 0:
+            h = DebugPoints(
+                hit_voxels,
+                points_rgb=list(hit_color),
+                size=voxel_size,
+            )
+            if isinstance(h, list):
+                debug_handles.extend(h)
+            else:
+                debug_handles.append(h)
+
+        # 3) Miss voxels (red)
+        if miss_voxels.size > 0:
+            h = DebugPoints(
+                miss_voxels,
+                points_rgb=list(miss_color),
+                size=voxel_size,
+            )
+            if isinstance(h, list):
+                debug_handles.extend(h)
+            else:
+                debug_handles.append(h)
+
+        print(
+            f"Visualized {gt_positions.shape[0]} GT points (blue), "
+            f"{hit_voxels.shape[0]} hit voxels (green), "
+            f"{miss_voxels.shape[0]} miss voxels (red)."
+        )
+
+        return debug_handles
 
 
 def main():
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Evaluate semantic octomap accuracy')
-    parser.add_argument('--ground_truth', type=str, required=True,
-                        help='Path to ground truth points JSON file')
-    parser.add_argument('--semantic_map', type=str, default=None,
-                        help='Path to saved semantic map (octree + semantic files)')
-    parser.add_argument('--output', type=str, default='evaluation_results.json',
-                        help='Output file for evaluation results')
-    parser.add_argument('--visualize', action='store_true',
-                        help='Show visualizations (confusion matrix, confidence distribution)')
-    
+
+    parser = argparse.ArgumentParser(description="Evaluate semantic octomap distances")
+    parser.add_argument(
+        "--ground_truth",
+        type=str,
+        required=True,
+        help="Path to ground truth points JSON file",
+    )
+    parser.add_argument(
+        "--octree",
+        type=str,
+        required=True,
+        help="Path to saved OctoMap binary (.bt or similar)",
+    )
+    parser.add_argument(
+        "--semantic",
+        type=str,
+        required=True,
+        help="Path to saved semantic map .npz file",
+    )
+    parser.add_argument(
+        "--dist_thresh",
+        type=float,
+        default=0.10,
+        help="Distance threshold (m) for hit vs miss",
+    )
+    parser.add_argument(
+        "--min_conf",
+        type=float,
+        default=0.0,
+        help="Minimum semantic confidence for voxels",
+    )
+
     args = parser.parse_args()
-    
-    # Load or create semantic map
-    # For now, this is a placeholder - you'll need to load your actual semantic map
-    print("Note: This script expects you to provide a semantic map.")
-    print("You can either:")
-    print("  1. Load a saved semantic map using --semantic_map")
-    print("  2. Modify this script to build the semantic map from scratch")
-    print("\nFor demonstration, exiting...")
-    
-    # TODO: Load semantic map
-    # if args.semantic_map:
-    #     semantic_map = SemanticOctoMap(...)
-    #     semantic_map.load_semantic(...)
-    # else:
-    #     # Build semantic map from demo
-    #     pass
-    
-    # evaluator = SemanticMapEvaluator(semantic_map, args.ground_truth)
-    # metrics = evaluator.evaluate()
-    
-    # if args.visualize:
-    #     evaluator.plot_confusion_matrix()
-    #     evaluator.plot_confidence_distribution()
-    
-    # evaluator.save_results(args.output)
+
+    # Bring up environment and tree object for visual in PyBullet
+    nbv_env = env.Env()
+    ground = Ground(
+        filename=os.path.join(nbv_env.asset_dir, "dirt_plane", "dirt_plane.urdf")
+    )
+    obj = load_object(
+        "apple_tree_crook_canker", obj_position=[0, 0, 0], scale=[0.8, 0.8, 0.8]
+    )
+    obstacles = [obj, ground]  # in case you need them later
+
+    # Load semantic octomap
+    semantic_map = SemanticOctoMap()
+    semantic_map.load_semantic(args.octree, args.semantic)
+
+    # Make sure class names are set (if not already in the npz)
+    if not semantic_map.class_names:
+        semantic_map.set_class_names({0: "Crook", 1: "Canker"})
+
+    # Evaluate
+    evaluator = SemanticMapDistanceEvaluator(
+        semantic_map,
+        args.ground_truth,
+        distance_threshold=args.dist_thresh,
+        score_radius=None,
+        min_confidence=args.min_conf,
+    )
+    metrics = evaluator.evaluate()
+
+    # 3D visualization: GT (blue), hit voxels (green), miss voxels (red)
+    evaluator.visualize_matches_3d(
+        gt_color=(0.0, 0.0, 1.0),
+        hit_color=(0.0, 1.0, 0.0),
+        miss_color=(1.0, 0.0, 0.0),
+        gt_size=10.0,
+        voxel_size=10.0,
+    )
+
+    # keep the window open depending on how env.Env is implemented
+    print("Semantic evaluation complete. Inspect the scene in PyBullet.")
+
+    # Keep running for visualization
+    print("Press Ctrl+C to exit")
+    try:
+        while True:
+            env.step_simulation(steps=1, realtime=True)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+
+    env.disconnect()
 
 
 if __name__ == "__main__":

@@ -111,6 +111,7 @@ class OctoMap(SceneRepresentation):
     def add_point_cloud(self, point_cloud: np.ndarray, sensor_origin: np.ndarray, max_range: float = -1.0, lazy_eval: bool = False, discretize: bool = True):
         """
         Add a point cloud to the octree.
+        Only add points within the defined bounds (if any) and within the maximum range.
         
         Args:
             point_cloud: Nx3 array of 3D points
@@ -126,6 +127,16 @@ class OctoMap(SceneRepresentation):
         
         if point_cloud.ndim != 2 or point_cloud.shape[1] != 3:
             raise ValueError(f"Point cloud must be Nx3, got shape {point_cloud.shape}")
+        
+        # Filter points by bounds if specified
+        if self.bounds is not None:
+            roi_min, roi_max = np.array(self.bounds[:3]), np.array(self.bounds[3:])
+            within_bounds_mask = np.all((point_cloud >= roi_min) & (point_cloud <= roi_max), axis=1)
+            point_cloud = point_cloud[within_bounds_mask]
+
+        if point_cloud.shape[0] == 0:
+            print("No points to add after applying bounds filter.")
+            return 0
 
         success_count = self.octree.insertPointCloud(point_cloud, sensor_origin=sensor_origin, max_range=max_range, lazy_eval=lazy_eval, discretize=discretize)
         return success_count
@@ -534,8 +545,7 @@ class SemanticOctoMap(OctoMap):
             return tuple(np.round(snapped, decimals=6))
     
     @staticmethod
-    def create_semantic_point_cloud_from_detections(rgb_image: np.ndarray, 
-                                                     point_cloud: np.ndarray, 
+    def create_semantic_point_cloud_from_detections(rgb_image: np.ndarray,
                                                      detections: List[Dict],
                                                      background_label: int = -1, 
                                                      background_confidence: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
@@ -545,8 +555,7 @@ class SemanticOctoMap(OctoMap):
         For overlapping detections, the detection with highest confidence is used.
         
         Args:
-            rgb_image: RGB image (H, W, 3)
-            point_cloud: Point cloud (N, 3) corresponding to image pixels
+            rgb_image: RGB image (H, W, 3) where H*W = N points
             detections: List of detection dicts with keys: 'bbox', 'class_id', 'confidence'
             background_label: Label for points not in any detection box
             background_confidence: Confidence for points not in any detection box
@@ -556,15 +565,11 @@ class SemanticOctoMap(OctoMap):
             confidences: Array of confidence scores (N,)
         """
         height, width = rgb_image.shape[:2]
+        N = height * width
         
         # Initialize all points with background label and confidence
-        labels = np.full(len(point_cloud), background_label, dtype=np.int32)
-        confidences = np.full(len(point_cloud), background_confidence, dtype=np.float32)
-        
-        # Check if point cloud matches image dimensions
-        if len(point_cloud) != height * width:
-            print(f"Warning: Point cloud size ({len(point_cloud)}) doesn't match image size ({height * width})")
-            return labels, confidences
+        labels = np.full(N, background_label, dtype=np.int32)
+        confidences = np.full(N, background_confidence, dtype=np.float32)
         
         # Sort detections by confidence (ascending), so higher confidence overwrites lower
         sorted_detections = sorted(detections, key=lambda d: d['confidence'])
@@ -780,7 +785,10 @@ class SemanticOctoMap(OctoMap):
                           min_confidence: float = 0.0,
                           colors: Optional[List[List[float]]] = None,
                           point_size: float = 5.0,
-                          max_points: int = 100000) -> List:
+                          max_points: int = 100000,
+                          visualize_free: bool = False,
+                          free_color: List[float] = [0, 1.0, 0],
+                          scale_by_confidence: bool = False) -> List:
         """
         Visualize semantic voxels, optionally filtered by label.
         
@@ -790,6 +798,9 @@ class SemanticOctoMap(OctoMap):
             colors: List of RGB colors for visualization (if None, auto-generate per label)
             point_size: Size of debug points
             max_points: Maximum number of points to visualize
+            visualize_free: If True, also visualize free voxels
+            free_color: RGB color for free voxels (occupied without semantic info)
+            scale_by_confidence: If True, scale point size based on confidence (0.5x to 2x)
             
         Returns:
             List of debug handles
@@ -808,11 +819,29 @@ class SemanticOctoMap(OctoMap):
                 print(f"WARN: Limiting visualization to {max_points} points.")
             
             viz_color = colors[0] if colors is not None else [1, 0, 1]
-            handles = DebugPoints(voxels, points_rgb=viz_color, size=point_size)
-            if isinstance(handles, list):
-                debug_handles.extend(handles)
+            
+            if scale_by_confidence:
+                # Visualize with varying sizes based on confidence
+                for voxel in voxels:
+                    voxel_key = tuple(voxel)
+                    semantic_info = self.semantic_map.get(voxel_key)
+                    if semantic_info:
+                        confidence = semantic_info['confidence']
+                        # Scale based on confidence (0 to 1)
+                        size_scale = 0.1 + 10 * confidence
+                        scaled_size = point_size * size_scale
+                        handles = DebugPoints([voxel], points_rgb=viz_color, size=scaled_size)
+                        if isinstance(handles, list):
+                            debug_handles.extend(handles)
+                        else:
+                            debug_handles.append(handles)
             else:
-                debug_handles.append(handles)
+                # Visualize all with uniform size
+                handles = DebugPoints(voxels, points_rgb=viz_color, size=point_size)
+                if isinstance(handles, list):
+                    debug_handles.extend(handles)
+                else:
+                    debug_handles.append(handles)
             
             label_name = self.class_names.get(label, f"Class {label}")
             print(f"Visualized {len(voxels)} voxels for {label_name}")
@@ -829,65 +858,93 @@ class SemanticOctoMap(OctoMap):
             
             if not label_to_voxels:
                 print("No semantic voxels to visualize")
-                return debug_handles
-            
-            # Generate colors for each label
-            unique_labels = sorted(label_to_voxels.keys())
-            if colors is None:
-                colors = _generate_distinct_colors(len(unique_labels))
-            
-            total_visualized = 0
-            for i, lbl in enumerate(unique_labels):
-                voxels = np.array(label_to_voxels[lbl])
-                if len(voxels) > max_points // len(unique_labels):
-                    voxels = voxels[:max_points // len(unique_labels)]
+            else:
+                # Generate colors for each label
+                unique_labels = sorted(label_to_voxels.keys())
+                if colors is None:
+                    colors = _generate_distinct_colors(len(unique_labels))
                 
-                viz_color = colors[i]
-                handles = DebugPoints(voxels, points_rgb=viz_color, size=point_size)
-                if isinstance(handles, list):
-                    debug_handles.extend(handles)
+                total_visualized = 0
+                for i, lbl in enumerate(unique_labels):
+                    voxels = np.array(label_to_voxels[lbl])
+                    if len(voxels) > max_points // len(unique_labels):
+                        voxels = voxels[:max_points // len(unique_labels)]
+                    
+                    viz_color = colors[i]
+                    
+                    if scale_by_confidence:
+                        # Visualize with varying sizes based on confidence
+                        for voxel in voxels:
+                            voxel_key = tuple(voxel)
+                            semantic_info = self.semantic_map.get(voxel_key)
+                            if semantic_info:
+                                confidence = semantic_info['confidence']
+                                # Scale from 0.5x to 2x based on confidence (0 to 1)
+                                size_scale = 0.5 + 1.5 * confidence
+                                scaled_size = point_size * size_scale
+                                handles = DebugPoints([voxel], points_rgb=viz_color, size=scaled_size)
+                                if isinstance(handles, list):
+                                    debug_handles.extend(handles)
+                                else:
+                                    debug_handles.append(handles)
+                    else:
+                        # Visualize all with uniform size
+                        handles = DebugPoints(voxels, points_rgb=viz_color, size=point_size)
+                        if isinstance(handles, list):
+                            debug_handles.extend(handles)
+                        else:
+                            debug_handles.append(handles)
+                    
+                    total_visualized += len(voxels)
+                
+                print(f"Visualized {total_visualized} semantic voxels across {len(unique_labels)} labels")
+            
+            # Visualize free voxels (not occupied) if requested
+            if visualize_free:
+                free_voxels = []
+                point_count = 0
+                
+                # Get all semantic voxel keys for exclusion
+                semantic_keys = set(self.semantic_map.keys())
+                
+                # Iterate through leaf nodes to find free (not occupied) voxels
+                if self.bounds is not None:
+                    roi_min, roi_max = np.array(self.bounds[:3]), np.array(self.bounds[3:])
+                    leaf_iterator = self.octree.begin_leafs_bbx(roi_min, roi_max)
                 else:
-                    debug_handles.append(handles)
+                    leaf_iterator = self.octree.begin_leafs()
                 
-                total_visualized += len(voxels)
-            
-            print(f"Visualized {total_visualized} semantic voxels across {len(unique_labels)} labels")
-        
+                max_free_points = max_points // 4  # Limit free voxels to 1/4 of max
+                for leaf_it in leaf_iterator:
+                    if point_count >= max_free_points:
+                        break
+                    
+                    try:
+                        # Only consider free (not occupied) voxels
+                        if self.octree.isNodeOccupied(leaf_it):
+                            continue
+                        
+                        coord = leaf_it.getCoordinate()
+                        point = np.array(coord, dtype=np.float64)
+                        voxel_key = tuple(np.round(point, decimals=6))
+                        
+                        # Check if this free voxel has no semantic label
+                        if voxel_key not in semantic_keys:
+                            free_voxels.append(point)
+                            point_count += 1
+                    except Exception:
+                        continue
+                
+                if len(free_voxels) > 0:
+                    free_voxels = np.array(free_voxels)
+                    handles = DebugPoints(free_voxels, points_rgb=free_color, size=point_size*0.9)
+                    if isinstance(handles, list):
+                        debug_handles.extend(handles)
+                    else:
+                        debug_handles.append(handles)
+                    print(f"Visualized {len(free_voxels)} free voxels (not occupied)")
+
         return debug_handles
-    
-    def visualize_uncertainty(self, max_confidence: float = 0.5,
-                             color: List[float] = [1, 0.5, 0],
-                             point_size: float = 5.0,
-                             max_points: int = 100000) -> List:
-        """
-        Visualize uncertain voxels (low confidence scores).
-        
-        Args:
-            max_confidence: Maximum confidence to be considered uncertain
-            color: RGB color for uncertain voxels
-            point_size: Size of debug points
-            max_points: Maximum number of points to visualize
-            
-        Returns:
-            List of debug handles
-        """
-        uncertain_voxels = self.get_uncertain_voxels(max_confidence)
-        
-        if len(uncertain_voxels) == 0:
-            print("No uncertain voxels found")
-            return []
-        
-        if len(uncertain_voxels) > max_points:
-            uncertain_voxels = uncertain_voxels[:max_points]
-            print(f"WARN: Limiting visualization to {max_points} points.")
-        
-        debug_handles = DebugPoints(uncertain_voxels, points_rgb=color, size=point_size)
-        print(f"Visualized {len(uncertain_voxels)} uncertain voxels")
-        
-        if isinstance(debug_handles, list):
-            return debug_handles
-        else:
-            return [debug_handles]
     
     def set_class_names(self, class_names: Dict[int, str]):
         """
