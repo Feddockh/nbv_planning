@@ -6,11 +6,6 @@ For each ground-truth point:
   - Compute Euclidean distance.
   - If distance <= threshold -> hit, else miss.
 
-Metrics:
-  - Hit rate
-  - Mean / median distance for hits
-  - Distance-weighted confidence score per GT point
-
 3D visualization:
   - Blue spheres  : ground-truth lesion points
   - Green spheres : matched semantic voxels (hits)

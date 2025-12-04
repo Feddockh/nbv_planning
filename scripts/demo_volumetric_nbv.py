@@ -87,7 +87,7 @@ camera = RobotCamera(robot, robot.end_effector,
                      camera_offset_pos=camera_offset_pos,
                      camera_offset_orient=camera_offset_orient,
                      fov=CAMERA_FOV, camera_width=CAMERA_WIDTH, camera_height=CAMERA_HEIGHT)
-detector = FireBlightDetector(confidence_threshold=CONFIDENCE_THRESHOLD)
+detector = FireBlightDetector(model_path=os.path.join("detection", "models", "best_sim.pt"), confidence_threshold=CONFIDENCE_THRESHOLD)
 
 # Initialize octomap
 semantic_octomap = SemanticOctoMap(bounds=obj_roi, resolution=OCTOMAP_RESOLUTION)
@@ -120,7 +120,7 @@ for iteration in range(MAX_ITERATIONS):
     print(f"\n=== Iteration {iteration + 1}/{MAX_ITERATIONS} ===")
 
     # Get the current image from the "camera" and display it
-    img, depth, segmentation_mask = camera.get_rgba_depth(flash=True, flash_intensity=2.5, shutter_speed=0.1, max_flash_distance=1.0)
+    img, depth, segmentation_mask = camera.get_rgba_depth(flash=True, flash_intensity=2.0, shutter_speed=0.1, max_flash_distance=1.0)
     img_rgb = img[:, :, :3]
     
     detections, annotated_img = detector.detect(img_rgb, visualize=True)
@@ -273,7 +273,7 @@ for iteration in range(MAX_ITERATIONS):
     # input("Press Enter to continue to next iteration...")    
 
 print("\nNBV planning demo complete.")
-semantic_octomap.save_semantic("volumetric_octomap_points.npz", "volumetric_octomap_labels.npz")
+semantic_octomap.save_semantic("volumetric_octomap_points_sim.npz", "volumetric_octomap_labels_sim.npz")
 
 # Keep running for visualization
 print("Press Ctrl+C to exit")
