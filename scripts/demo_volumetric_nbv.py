@@ -27,11 +27,18 @@ from viewpoints.viewpoint import Viewpoint, visualize_viewpoint, compute_viewpoi
 from viewpoints.viewpoint_selection import compute_information_gain
 from bodies.planning import MotionPlanner
 from detection.fire_blight_detector import FireBlightDetector
+from metrics.metrics_logger import MetricsLogger
+from metrics.evaluate_semantic_map import SemanticMapDistanceEvaluator
 
 
 # ===== Configuration =====
+repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXPERIMENT_NAME = "volumetric_nbv_default"  # Subfolder name for outputs
+GROUND_TRUTH_FILE = os.path.join(repo_dir, "assets", "apple_tree_semantic_ground_truths.json")  # Path to ground truth file for evaluation
+LOGGING = True  # Whether to log and evaluate semantic mapping performance
+EVAL_DISTANCE_THRESHOLD = 0.1  # Distance threshold for semantic evaluation (in meters)
 LEARN_WORKSPACE = False
-OCTOMAP_RESOLUTION = 0.04
+OCTOMAP_RESOLUTION = 0.02
 NUM_SAMPLES_PER_FRONTIER = 5
 MAX_ITERATIONS = 30
 CAMERA_WIDTH = 1440
@@ -44,7 +51,7 @@ MISMATCH_PENALTY = 0.1
 CONFIDENCE_BOOST = 0.05
 ALPHA = 0.1 # Cost weight for utility calculation
 MIN_INFORMATION_GAIN = 0.1 # Minimum information gain to continue planning
-CONFIDENCE_THRESHOLD = 0.1
+CONFIDENCE_THRESHOLD = 0.5
 
 # ===== Main Script =====
 # Create environment and ground
@@ -87,7 +94,7 @@ camera = RobotCamera(robot, robot.end_effector,
                      camera_offset_pos=camera_offset_pos,
                      camera_offset_orient=camera_offset_orient,
                      fov=CAMERA_FOV, camera_width=CAMERA_WIDTH, camera_height=CAMERA_HEIGHT)
-detector = FireBlightDetector(model_path=os.path.join("detection", "models", "best_sim.pt"), confidence_threshold=CONFIDENCE_THRESHOLD)
+detector = FireBlightDetector(model_path="best_sim.pt", confidence_threshold=CONFIDENCE_THRESHOLD)
 
 # Initialize octomap
 semantic_octomap = SemanticOctoMap(bounds=obj_roi, resolution=OCTOMAP_RESOLUTION)
@@ -96,6 +103,24 @@ semantic_octomap.set_class_names({
     0: "Shepherd's Crook",
     1: "Canker"
 })
+
+# Initialize metrics logger and evaluator
+if LOGGING:
+    print("Logging enabled: Semantic mapping performance will be evaluated.")
+    logger = MetricsLogger(output_dir="output", experiment_name=EXPERIMENT_NAME)
+    if os.path.exists(GROUND_TRUTH_FILE):
+        print(f"Ground truth file found: {GROUND_TRUTH_FILE}")
+        evaluator = SemanticMapDistanceEvaluator(
+            semantic_map=semantic_octomap,
+            ground_truth_file=GROUND_TRUTH_FILE,
+            distance_threshold=EVAL_DISTANCE_THRESHOLD,  # 10cm threshold
+            min_confidence=CONFIDENCE_THRESHOLD
+        )
+    else:
+        print(f"ERROR: Ground truth file not found: {GROUND_TRUTH_FILE}")
+        LOGGING = False
+else:
+    print("Logging disabled.")
 
 # Initial configuration of the robot to view the object
 init_position = [0.5, 0, 1.25]
@@ -109,7 +134,7 @@ camera_pos, camera_orient = camera.get_camera_pose()
 
 # Start the NBV planning loop
 print("\n=== Starting NBV Planning ===")
-input("Press Enter to begin...")
+# input("Press Enter to begin...")
 
 # NBV planning iterations
 best_information_gain = np.inf
@@ -122,7 +147,8 @@ for iteration in range(MAX_ITERATIONS):
     # Get the current image from the "camera" and display it
     img, depth, segmentation_mask = camera.get_rgba_depth(flash=True, flash_intensity=2.0, shutter_speed=0.1, max_flash_distance=1.0)
     img_rgb = img[:, :, :3]
-    
+
+    # Detect using RGB image (detector will handle BGR conversion)
     detections, annotated_img = detector.detect(img_rgb, visualize=True)
     print(f"Total detections: {len(detections)}")
     # plt.imshow(annotated_img)
@@ -269,11 +295,63 @@ for iteration in range(MAX_ITERATIONS):
     # Move the robot to the best viewpoint if there is one
     print(f"\nMoving to best joint angles: {best_joint_angles}")
     robot.control(best_joint_angles, set_instantly=True)
+    
+    # Logging and evaluation
+    if LOGGING:
+        # Compute coverage statistics
+        coverage_stats = semantic_octomap.compute_coverage()
+        print(f"Coverage: {coverage_stats['coverage_percent']:.2f}% ({coverage_stats['known_voxels']}/{coverage_stats['total_voxels']} voxels)")
+        
+        # Evaluate semantic map quality (if evaluator exists)
+        eval_results = evaluator.evaluate(verbose=False)
+        
+        # Log iteration metrics
+        logger.log_iteration(
+            iteration=iteration + 1,
+            # Coverage metrics
+            total_voxels=coverage_stats['total_voxels'],
+            known_voxels=coverage_stats['known_voxels'],
+            occupied_voxels=coverage_stats['occupied_voxels'],
+            free_voxels=coverage_stats['free_voxels'],
+            unknown_voxels=coverage_stats['unknown_voxels'],
+            coverage_percent=coverage_stats['coverage_percent'],
+            occupied_percent=coverage_stats['occupied_percent'],
+            # Semantic evaluation metrics
+            total_predictions=eval_results.get('total_predictions', None),
+            true_positives=eval_results.get('num_TP', None),
+            false_positives=eval_results.get('num_FP', None),
+            false_negatives=eval_results.get('num_FN', None),
+            hit_rate=eval_results.get('hit_rate', None),
+            tp_avg_distance=eval_results.get('TP_avg_distance', None),
+            fp_avg_distance=eval_results.get('FP_avg_distance', None),
+            tp_avg_confidence=eval_results.get('TP_avg_confidence', None),
+            fp_avg_confidence=eval_results.get('FP_avg_confidence', None),
+            tp_max_confidence=eval_results.get('TP_max_confidence', None),
+            fp_max_confidence=eval_results.get('FP_max_confidence', None),
+        )
+        
+        # Update plots and save data
+        logger.save_data()
+        logger.plot_metrics(save=True, show=False)
+    
     # visualize_viewpoint(best_vp)
     # input("Press Enter to continue to next iteration...")    
 
 print("\nNBV planning demo complete.")
-semantic_octomap.save_semantic("volumetric_octomap_points_sim.npz", "volumetric_octomap_labels_sim.npz")
+
+# Save final octomap and generate summary
+if LOGGING:
+    # Save final octomap to output directory
+    octomap_points_path = os.path.join(logger.data_dir, "volumetric_octomap_points.npz")
+    octomap_labels_path = os.path.join(logger.data_dir, "volumetric_octomap_labels.npz")
+    semantic_octomap.save_semantic(octomap_points_path, octomap_labels_path)
+    
+    # Generate final summary and plots
+    logger.print_summary()
+    logger.plot_combined_metrics({
+        'Coverage Metrics': ['known_voxels', 'unknown_voxels'],
+        'Detection Quality': ['true_positives', 'false_positives', 'false_negatives'],
+    }, save=True, show=False)
 
 # Keep running for visualization
 print("Press Ctrl+C to exit")

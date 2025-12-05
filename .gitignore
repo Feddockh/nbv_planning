@@ -5,3 +5,7 @@ __pycache__/
 *.npz
 *.pt
 *.pth
+
+# Output directories (keep structure, ignore contents)
+output/*/
+!output/.gitkeep

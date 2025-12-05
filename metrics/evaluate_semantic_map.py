@@ -109,12 +109,15 @@ class SemanticMapDistanceEvaluator:
                 return i
         return -1
 
-    def evaluate(self) -> Dict:
+    def evaluate(self, verbose: bool = True) -> Dict:
         """
         For each labeled GT point:
           - Get voxels of same label with confidences.
           - Compute nearest distance (for hit/miss).
           - Compute distance-weighted confidence score S(g).
+
+        Args:
+            verbose: If True, print results to console
 
         Returns:
             metrics dict with hit_rate, distances, semantic scores, etc.
@@ -181,6 +184,13 @@ class SemanticMapDistanceEvaluator:
                 # Not matched, add to FN list
                 results["FNs"].append(gt_pt)
 
+        # Compute metrics
+        num_TP = len(results["TPs"])
+        num_FP = len(results["FPs"])
+        num_FN = len(results["FNs"])
+        total_predictions = num_TP + num_FP
+        hit_rate = num_TP / total_predictions if total_predictions > 0 else 0.0
+
         # Compute the average TP and FP distances
         results["TP_avg_distance"] = np.mean(results["TP_distances"]) if results["TP_distances"] else float('nan')
         results["FP_avg_distance"] = np.mean(results["FP_distances"]) if results["FP_distances"] else float('nan')
@@ -193,29 +203,38 @@ class SemanticMapDistanceEvaluator:
         results["TP_max_confidence"] = max(results["TP_confidences"]) if results["TP_confidences"] else float('nan')
         results["FP_max_confidence"] = max(results["FP_confidences"]) if results["FP_confidences"] else float('nan')
         
+        # Add summary metrics
+        results["total_predictions"] = total_predictions
+        results["num_TP"] = num_TP
+        results["num_FP"] = num_FP
+        results["num_FN"] = num_FN
+        results["hit_rate"] = hit_rate
+        
         self.results = results
-        self._print_results(results)
+        if verbose:
+            self._print_results(results)
         return results
     
     def _print_results(self, results: Dict):
-        num_TP = len(results["TPs"])
-        num_FP = len(results["FPs"])
-        num_FN = len(results["FNs"])
+        num_TP = results["num_TP"]
+        num_FP = results["num_FP"]
+        num_FN = results["num_FN"]
+        total_predictions = results["total_predictions"]
         labeled_gts = [pt for pt in self.ground_truth["points"] if pt.get("label", None) is not None]
         total_gt = len(labeled_gts)
-        hit_rate = num_TP / (num_TP + num_FP) if (num_TP + num_FP) > 0 else 0.0
+        hit_rate = results["hit_rate"]
 
         print("\nSemantic Map Distance Evaluation Results:")
         print(f"  Total ground-truth points : {total_gt}")
-        print(f"  Total predictions         : {num_TP + num_FP}")
+        print(f"  Total predictions         : {total_predictions}")
         print(f"  True Positives (hits)     : {num_TP}")
         print(f"  False Positives (misses)  : {num_FP}")
         print(f"  False Negatives           : {num_FN}")
         print(f"  Hit Rate                  : {hit_rate*100:.2f}%")
-        print(f"  Avg TP Distance (m)       : {results['TP_avg_distance']:.4f}")
-        print(f"  Avg FP Distance (m)       : {results['FP_avg_distance']:.4f}")
-        print(f"  Avg TP Confidence         : {results['TP_avg_confidence']:.4f}")
-        print(f"  Avg FP Confidence         : {results['FP_avg_confidence']:.4f}")
+        print(f"  Avg TP Distance (m)       : {results['TP_avg_distance']:.4f}" if not np.isnan(results['TP_avg_distance']) else "  Avg TP Distance (m)      : N/A")
+        print(f"  Avg FP Distance (m)       : {results['FP_avg_distance']:.4f}" if not np.isnan(results['FP_avg_distance']) else "  Avg FP Distance (m)      : N/A")
+        print(f"  Avg TP Confidence         : {results['TP_avg_confidence']:.4f}" if not np.isnan(results['TP_avg_confidence']) else "  Avg TP Confidence        : N/A")
+        print(f"  Avg FP Confidence         : {results['FP_avg_confidence']:.4f}" if not np.isnan(results['FP_avg_confidence']) else "  Avg FP Confidence        : N/A")
         print(f"  Max TP Confidence         : {results['TP_max_confidence']:.4f}" if not np.isnan(results['TP_max_confidence']) else "  Max TP Confidence        : N/A")
         print(f"  Max FP Confidence         : {results['FP_max_confidence']:.4f}" if not np.isnan(results['FP_max_confidence']) else "  Max FP Confidence        : N/A")
 

@@ -8,6 +8,7 @@ import os
 import numpy as np
 from typing import List, Tuple, Optional, Dict
 from pathlib import Path
+from ultralytics import YOLO
 
 
 class FireBlightDetector:
@@ -18,7 +19,7 @@ class FireBlightDetector:
     inference on images to detect fire blight symptoms.
     """
     
-    def __init__(self, model_path: Optional[str] = None, confidence_threshold: float = 0.5):
+    def __init__(self, model_path: Optional[str] = None, confidence_threshold: float = 0.5, auto_convert_rgb: bool = True):
         """
         Initialize the Fire Blight detector.
         
@@ -26,38 +27,37 @@ class FireBlightDetector:
             model_path: Path to the YOLOv8 model weights (.pt file).
                        If None, looks for 'best.pt' in detection/models/ directory.
             confidence_threshold: Minimum confidence score for detections (0-1).
+            auto_convert_rgb: If True, automatically convert RGB input to BGR for YOLO.
+                            Set to False if you're already providing BGR images.
         """
-        try:
-            from ultralytics import YOLO
-            self.YOLO = YOLO
-        except ImportError:
-            raise ImportError(
-                "ultralytics package not found. Please install it with:\n"
-                "  pip install ultralytics\n"
-                "or\n"
-                "  conda install -c conda-forge ultralytics"
-            )
-        
+
         # Determine model path
-        if model_path is None:
-            # Default to best.pt in the models directory
-            script_dir = Path(__file__).parent
-            model_path = script_dir / "models" / "best.pt"
-        
-        model_path = Path(model_path)
-        
-        if not model_path.exists():
+        detection_dir = os.path.dirname(os.path.abspath(__file__))
+        model_dir = os.path.join(detection_dir, "models")
+        # Check if a model name is given
+        if os.path.exists(os.path.join(model_dir, model_path)):
+            model_path = os.path.join(model_dir, model_path)
+        # Check if the model is an abs path
+        elif os.path.isabs(model_path) and os.path.exists(model_path):
+            model_path = model_path
+        # If model path is None, use default
+        elif model_path is None:
+            model_path = os.path.join(model_dir, "best.pt")
+        # Otherwise throw error if not found
+        else:
             raise FileNotFoundError(
                 f"Model file not found at: {model_path}\n"
                 f"Please place your YOLOv8 model weights (.pt file) in:\n"
-                f"  {script_dir / 'models' / 'best.pt'}\n"
+                f"  {os.path.join(model_dir, 'best.pt')}\n"
                 f"or provide a custom path when initializing the detector."
             )
         
         print(f"Loading YOLOv8 model from: {model_path}")
-        self.model = self.YOLO(str(model_path))
+        self.model = YOLO(str(model_path))
         self.confidence_threshold = confidence_threshold
+        self.auto_convert_rgb = auto_convert_rgb
         print(f"Model loaded successfully. Confidence threshold: {confidence_threshold}")
+        print(f"Auto RGB to BGR conversion: {auto_convert_rgb}")
         
         # Cache class names
         self.class_names = self.model.names if hasattr(self.model, 'names') else {}
@@ -69,6 +69,8 @@ class FireBlightDetector:
         
         Args:
             image: Input image as numpy array (H, W, 3) in RGB or BGR format
+                  If auto_convert_rgb=True (default), expects RGB and converts to BGR
+                  If auto_convert_rgb=False, expects BGR format
             visualize: If True, return annotated image
             
         Returns:
@@ -78,9 +80,16 @@ class FireBlightDetector:
                 - 'class_id': integer class ID
                 - 'class_name': string class name
                 - 'center': [cx, cy] center of bounding box
+            If visualize=True, also returns annotated image in the same format as input
         """
+        # Convert RGB to BGR if needed
+        if self.auto_convert_rgb:
+            image_bgr = image[:, :, ::-1]  # RGB to BGR
+        else:
+            image_bgr = image
+        
         # Run inference
-        results = self.model(image, conf=self.confidence_threshold, verbose=False)
+        results = self.model(image_bgr, conf=self.confidence_threshold, verbose=False)
         
         detections = []
         
@@ -117,7 +126,10 @@ class FireBlightDetector:
         
         if visualize:
             # Get annotated image
-            annotated_img = results[0].plot() if len(results) > 0 else image
+            annotated_img = results[0].plot() if len(results) > 0 else image_bgr
+            # Convert back to original format if we converted to BGR
+            if self.auto_convert_rgb:
+                annotated_img = annotated_img[:, :, ::-1]  # BGR to RGB
             return detections, annotated_img
         
         return detections

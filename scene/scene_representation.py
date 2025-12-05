@@ -490,6 +490,62 @@ class OctoMap(SceneRepresentation):
             return None
         return self.octree.isNodeOccupied(node)
     
+    def compute_coverage(self) -> Dict[str, float]:
+        """
+        Compute the percentage of the bounded region that has been explored.
+        
+        Returns:
+            Dict containing:
+                - 'total_voxels': Total number of voxels in the bounded region
+                - 'known_voxels': Number of known voxels (occupied + free)
+                - 'occupied_voxels': Number of occupied voxels
+                - 'free_voxels': Number of free voxels
+                - 'unknown_voxels': Number of unknown voxels
+                - 'coverage_percent': Percentage of region that is known (0-100)
+                - 'occupied_percent': Percentage of known voxels that are occupied (0-100)
+        """
+        if self.bounds is None:
+            raise ValueError("Bounds must be defined to compute coverage")
+        
+        roi_min, roi_max = np.array(self.bounds[:3]), np.array(self.bounds[3:])
+        
+        # Calculate total number of voxels in the bounded region
+        region_size = roi_max - roi_min
+        voxels_per_dim = np.ceil(region_size / self.resolution).astype(int)
+        total_voxels = int(np.prod(voxels_per_dim))
+        
+        # Count known voxels (occupied + free)
+        known_voxels = 0
+        occupied_voxels = 0
+        free_voxels = 0
+        
+        # Iterate through all leaf nodes in the bounded region
+        leaf_iterator = self.octree.begin_leafs_bbx(roi_min, roi_max)
+        
+        for leaf_it in leaf_iterator:
+            try:
+                if self.octree.isNodeOccupied(leaf_it):
+                    occupied_voxels += 1
+                else:
+                    free_voxels += 1
+                known_voxels += 1
+            except Exception:
+                continue
+        
+        unknown_voxels = total_voxels - known_voxels
+        coverage_percent = (known_voxels / total_voxels * 100.0) if total_voxels > 0 else 0.0
+        occupied_percent = (occupied_voxels / known_voxels * 100.0) if known_voxels > 0 else 0.0
+        
+        return {
+            'total_voxels': total_voxels,
+            'known_voxels': known_voxels,
+            'occupied_voxels': occupied_voxels,
+            'free_voxels': free_voxels,
+            'unknown_voxels': unknown_voxels,
+            'coverage_percent': coverage_percent,
+            'occupied_percent': occupied_percent,
+        }
+    
     def save(self, filename: str):
         """Save octree to file."""
         self.octree.writeBinary(filename)
