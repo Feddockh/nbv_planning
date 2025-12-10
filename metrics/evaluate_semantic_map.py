@@ -13,11 +13,13 @@ For each ground-truth point:
 """
 
 import os
+import sys
 import json
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import env
 from scene.objects import URDF, Ground, load_object, DebugPoints
 from scene.scene_representation import SemanticOctoMap
